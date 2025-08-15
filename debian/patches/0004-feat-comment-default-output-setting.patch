@@ -1,0 +1,31 @@
+From e3f4e4fd3dd3610ee8c47fc7d27812e3040e915d Mon Sep 17 00:00:00 2001
+From: Birger Schacht <birger@debian.org>
+Date: Sat, 4 Jan 2025 16:37:47 +0100
+Subject: [PATCH] feat: comment default output setting
+
+We comment the default output setting, because the Sway wallpaper files
+are shipped in a separate package `sway-backgrounds`. Installing this
+package drops a config file to @sysconfdir@/sway/config.d/
+---
+ config.in | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/config.in b/config.in
+index a2a01dda..87755981 100644
+--- a/config.in
++++ b/config.in
+@@ -21,7 +21,10 @@ set $menu wmenu-run
+ ### Output configuration
+ #
+ # Default wallpaper (more resolutions are available in @datadir@/backgrounds/sway/)
+-output * bg @datadir@/backgrounds/sway/Sway_Wallpaper_Blue_1920x1080.png fill
++# This is commented in Debian, because the Sway wallpaper files are in a separate
++# package `sway-backgrounds`. Installing this package drops a config file to
++# @sysconfdir@/sway/config.d/
++# output * bg @datadir@/backgrounds/sway/Sway_Wallpaper_Blue_1920x1080.png fill
+ #
+ # Example configuration:
+ #
+-- 
+2.47.1
+
