@@ -2,7 +2,7 @@ Index: sway-regolith/meson.build
 ===================================================================
 --- sway-regolith.orig/meson.build
 +++ sway-regolith/meson.build
-@@ -157,18 +157,18 @@ endif
+@@ -157,18 +156,18 @@ endif
  add_project_arguments('-DSYSCONFDIR="/@0@"'.format(join_paths(prefix, sysconfdir)), language : 'c')
  
  version = '"@0@"'.format(meson.project_version())
@@ -32,4 +32,4 @@ Index: sway-regolith/meson.build
 +# endif
  add_project_arguments('-DSWAY_VERSION=@0@'.format(version), language: 'c')
  
- fs = import('fs')
+ # Compute the relative path used by compiler invocations.

@@ -10,11 +10,11 @@ package drops a config file to @sysconfdir@/sway/config.d/
  config.in | 5 ++++-
  1 file changed, 4 insertions(+), 1 deletion(-)
 
-diff --git a/config.in b/config.in
-index a2a01dda..87755981 100644
---- a/config.in
-+++ b/config.in
-@@ -21,7 +21,10 @@ set $menu wmenu-run
+Index: sway-regolith/config.in
+===================================================================
+--- sway-regolith.orig/config.in
++++ sway-regolith/config.in
+@@ -23,7 +23,10 @@ include /etc/sway/config-vars.d/*
  ### Output configuration
  #
  # Default wallpaper (more resolutions are available in @datadir@/backgrounds/sway/)
@@ -26,6 +26,3 @@ index a2a01dda..87755981 100644
  #
  # Example configuration:
  #
--- 
-2.47.1
-
