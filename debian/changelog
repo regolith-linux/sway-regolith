@@ -1,3 +1,10 @@
+sway-regolith (1.7-9) jammy; urgency=medium
+
+  [ Khosrow Moossavi ]
+  * feat: use build-only to test pull request
+
+ -- Regolith Linux <regolith.linux@gmail.com>  Sat, 18 Oct 2025 18:23:56 +0000
+
 sway-regolith (1.7-8) jammy; urgency=medium
 
   * UNRELEASED
