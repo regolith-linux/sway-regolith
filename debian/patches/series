@@ -1,0 +1,7 @@
+0001-Install-zsh-completions-into-the-correct-directory.patch
+0002-Modify-default-configuration-for-Debian.patch
+0004-feat-comment-default-output-setting.patch
+01-regolith-trawl.patch
+02-version-fix.patch
+04-dbus-tray
+05-remove-config
