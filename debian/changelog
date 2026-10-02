@@ -1,0 +1,573 @@
+sway (1.12-1) unstable; urgency=medium
+
+  * New upstream release
+
+ -- Birger Schacht <birger@debian.org>  Mon, 25 May 2026 17:38:40 +0200
+
+sway (1.12~rc3-2) unstable; urgency=medium
+
+  [ Diederik de Haas ]
+  * debian/control: Update various BDs
+
+  [ Birger Schacht ]
+  * Reupload to unstable
+  * debian/control:
+   + bump wayland-protocols dependency min version
+   + drop redundant Rules-Required-Root and Priority fields
+   + bump Standards-Version to 4.7.4 (no changes required)
+  * debian/config.d/50-systemd-user.conf: pass XDG_CURRENT_DESKTOP through if
+    already set, add wlroots if not set (Closes: #1081800)
+  * debian/watch: update watchfile to version 5
+  * debian/copyright
+   + remove superfluous file pattern
+   + remove unused license paragraph
+   + bump copyright years
+
+ -- Birger Schacht <birger@debian.org>  Mon, 25 May 2026 08:13:00 +0200
+
+sway (1.12~rc3-1) experimental; urgency=medium
+
+  * New upstream release
+
+ -- Birger Schacht <birger@debian.org>  Sun, 26 Apr 2026 17:05:22 +0200
+
+sway (1.12~rc2-1) experimental; urgency=medium
+
+  * New upstream release
+
+ -- Birger Schacht <birger@debian.org>  Thu, 16 Apr 2026 08:38:11 +0200
+
+sway (1.12~rc1-1) experimental; urgency=medium
+
+  * New upstream release
+  * debian/control: bump libwlroots dependency to 0.20.0
+
+ -- Birger Schacht <birger@debian.org>  Fri, 27 Mar 2026 06:54:56 +0100
+
+sway (1.12~pre1.845cdb19-1) experimental; urgency=medium
+
+  * Cut preliminary version from git to test in experimental
+  * debian/control: bump libwlroots dependency to version 0.20-rc1
+  * debian/gbp.conf: drop pristine-tar from configuration
+  * debian/patches:
+   + drop included patch 0005-xdg-shell-fix-reported-WM-capabilities
+   + drop included patch 0006-revert_drag_lock_default_to_disabled
+
+ -- Birger Schacht <birger@debian.org>  Fri, 06 Feb 2026 20:59:02 +0100
+
+sway (1.11-3) unstable; urgency=medium
+
+  [ Diederik de Haas ]
+  * d/patches: Add 'xdg-shell: fix reported WM capabilities'
+
+  [ Birger Schacht ]
+  * d/patches: backport patch to revert drag lock default to disabled
+    Closes: #1116996
+
+ -- Birger Schacht <birger@debian.org>  Sun, 05 Oct 2025 20:07:19 +0200
+
+sway (1.11-2) unstable; urgency=medium
+
+  * Reupload to unstable
+  * Bump wlroots build-dep in debian/control
+
+ -- Birger Schacht <birger@debian.org>  Tue, 26 Aug 2025 15:48:12 +0200
+
+sway (1.11-1) experimental; urgency=medium
+
+  * New upstream release
+
+ -- Birger Schacht <birger@debian.org>  Tue, 10 Jun 2025 19:34:28 +0200
+
+sway (1.11~rc4-1) experimental; urgency=medium
+
+  * New upstream release
+
+ -- Birger Schacht <birger@debian.org>  Mon, 26 May 2025 18:31:20 +0200
+
+sway (1.11~rc2-1) experimental; urgency=medium
+
+  * New upstream release
+  * Bump wlroots version in debian/control
+  * Drop 0003-add-DesktopNames-to-sway.desktop.patch
+  * Replace old FSF address in debian/copyright
+
+ -- Birger Schacht <birger@debian.org>  Mon, 28 Apr 2025 19:21:25 +0200
+
+sway (1.10.1-2) unstable; urgency=medium
+
+  * Move sway-backgrounds from recommends to suggests (Closes: #1014753)
+
+ -- Birger Schacht <birger@debian.org>  Tue, 04 Feb 2025 14:49:16 +0100
+
+sway (1.10.1-1) unstable; urgency=medium
+
+  * New upstream release
+  * debian/patches: add patch to disable default output setting
+    (Closes: #1014753)
+  * debian/config.d: ship a separate config file containing the output
+    setting pointing to the sway background
+  * debian/sway-backgrounds.install: ship the introduced config snipped as
+    part of the sway-backgrounds package
+  * debian/control: move polkitd from Depends to Recommends (Closes: #1028047)
+
+ -- Birger Schacht <birger@debian.org>  Sun, 26 Jan 2025 16:51:30 +0100
+
+sway (1.10-2) unstable; urgency=medium
+
+  * Reupload to unstable
+
+ -- Birger Schacht <birger@debian.org>  Thu, 26 Dec 2024 14:52:07 +0100
+
+sway (1.10-1) experimental; urgency=medium
+
+  * New upstream release
+
+ -- Birger Schacht <birger@debian.org>  Mon, 28 Oct 2024 09:01:31 +0100
+
+sway (1.10~rc4-1) experimental; urgency=medium
+
+  * New upstream release
+  * d/control: remove accidentally readded build depends
+
+ -- Birger Schacht <birger@debian.org>  Mon, 21 Oct 2024 18:14:47 +0200
+
+sway (1.10~rc3-1) experimental; urgency=medium
+
+  * New upstream release
+
+ -- Birger Schacht <birger@debian.org>  Sun, 13 Oct 2024 18:51:17 +0200
+
+sway (1.10~rc2-1) experimental; urgency=medium
+
+  * New upstream release
+
+  [ Diederik de Haas ]
+  * d/control: Set minimum libxkbcommon BD requirement.
+  * d/control: Remove unneeded Build-Depends.
+
+ -- Birger Schacht <birger@debian.org>  Mon, 07 Oct 2024 18:11:34 +0200
+
+sway (1.10~rc1-1) experimental; urgency=medium
+
+  * New upstream release.
+  * d/control: bump wlroots build dependency to 0.18
+  * d/patches: update patch to modify default configuration
+  * d/copyright: drop superfluous file pattern
+    (wlr-input-inhibitor-unstable-v1 has been dropped)
+
+ -- Birger Schacht <birger@debian.org>  Sun, 29 Sep 2024 19:41:22 +0200
+
+sway (1.9-2) unstable; urgency=medium
+
+  [ Roman Blanco ]
+  * Set compositor name in user session variable (Closes: #1077891)
+
+  [ Birger Schacht]
+  * Bump Standards-Version (no changes required)
+  * Run wrap-and-sort -ast on debian/
+
+ -- Birger Schacht <birger@debian.org>  Tue, 13 Aug 2024 20:07:40 +0200
+
+sway (1.9-1) unstable; urgency=medium
+
+  * New upstream release
+  * Add d/sway-portals.conf and add xdg-desktop-portal-gtk to Suggests
+    (Closes: #1050913)
+  * Add patch to add DesktopNames to sway.dekstop (Closes: #1021545)
+
+ -- Birger Schacht <birger@debian.org>  Sun, 25 Feb 2024 09:18:37 +0100
+
+sway (1.9~rc.4-1) unstable; urgency=medium
+
+  * New upstream release
+
+ -- Birger Schacht <birger@debian.org>  Sat, 17 Feb 2024 20:29:42 +0100
+
+sway (1.9~rc.3-1) unstable; urgency=medium
+
+  * new upstream release
+
+ -- Birger Schacht <birger@debian.org>  Fri, 09 Feb 2024 21:13:37 +0100
+
+sway (1.9~rc.2-1) unstable; urgency=medium
+
+  * New upstream release
+
+ -- Birger Schacht <birger@debian.org>  Mon, 05 Feb 2024 10:31:40 +0100
+
+sway (1.9~rc.1-1) unstable; urgency=medium
+
+  * New upstream release
+  * d/copyright: Bump years
+
+ -- Birger Schacht <birger@debian.org>  Fri, 26 Jan 2024 17:56:44 +0100
+
+sway (1.9~debian.2bba8a86-2) unstable; urgency=medium
+
+  * Reupload to unstable
+
+ -- Birger Schacht <birger@debian.org>  Sat, 13 Jan 2024 09:28:54 +0100
+
+sway (1.9~debian.2bba8a86-1) experimental; urgency=medium
+
+  * Upload unreleased v1.9 version for wlroots 0.17 compatibility
+    (Closes: #1058496)
+  * Update 0001-Install-zsh-completions-into-the-correct-directory.patch
+  * Update 0002-Modify-default-configuration-for-Debian.patch
+  * Drop 0003-backport-libinput-fix.patch
+  * Replace Recommends: suckless-tools with Recommends: wmenu
+  * Bump version constraints of libwayland-dev and libwlroots-dev
+  * Drop grimshot, as it was removed from the swaywm source
+
+ -- Birger Schacht <birger@debian.org>  Sat, 23 Dec 2023 11:17:49 +0100
+
+sway (1.8.1-2) unstable; urgency=medium
+
+  * Upload to unstable (Closes: #1038794)
+  * Backport libinput fix from
+    https://github.com/swaywm/sway/commit/dee032d0a0ecd958c902b88302dc59703d703c7f
+    to make sway build with the newest libinput release
+
+ -- Birger Schacht <birger@debian.org>  Sun, 23 Jul 2023 17:25:27 +0200
+
+sway (1.8.1-1) experimental; urgency=medium
+
+  * New upstream version
+  * Bump version of libinput dependency (Closes: #1029382)
+  * Bump standards-version (no changes required)
+  * Replace obsolete build-dependency libgdk-pixbuf2.0-dev with
+    libgdk-pixbuf-2.0-dev
+  * Bump year and fix email address in d/copyright
+
+ -- Birger Schacht <birger@debian.org>  Mon, 30 Jan 2023 19:06:06 +0100
+
+sway (1.8-1) experimental; urgency=medium
+
+  * New upstream version
+
+ -- Birger Schacht <birger@debian.org>  Sun, 25 Dec 2022 17:13:17 +0100
+
+sway (1.8~rc4-1) experimental; urgency=medium
+
+  * New upstream version
+
+ -- Birger Schacht <birger@debian.org>  Mon, 19 Dec 2022 16:35:46 +0100
+
+sway (1.8~rc3-1) experimental; urgency=medium
+
+  * New upstream version
+
+ -- Birger Schacht <birger@debian.org>  Mon, 12 Dec 2022 14:51:40 +0100
+
+sway (1.8~rc2-1) experimental; urgency=medium
+
+  * New upstream version
+
+ -- Birger Schacht <birger@debian.org>  Sat, 03 Dec 2022 20:24:01 +0100
+
+sway (1.8~rc1-1) experimental; urgency=medium
+
+  * New upstream version
+  * Drop backported patches
+  * d/control: bump wlroots build-dependency version
+
+  [ Fabian Grünbichler ]
+  * d/control: correct version meson
+
+  [ Debian Janitor ]
+  * Use secure URI in Homepage field.
+  * Set field Upstream-Name in debian/copyright.
+  * Remove obsolete field Name from debian/upstream/metadata (already present in
+    machine-readable debian/copyright).
+
+ -- Birger Schacht <birger@debian.org>  Mon, 28 Nov 2022 11:27:06 +0100
+
+sway (1.7-6) unstable; urgency=medium
+
+  * Fix d/watch file by switching to gitmode
+
+ -- Birger Schacht <birger@debian.org>  Fri, 14 Oct 2022 11:09:38 +0200
+
+sway (1.7-5) unstable; urgency=medium
+
+  * Backport pcre2 criteria checking patch (Closes: #1019567)
+
+ -- Birger Schacht <birger@debian.org>  Mon, 12 Sep 2022 15:07:20 +0200
+
+sway (1.7-4) unstable; urgency=medium
+
+  * Replace sway dependency on policykit-1 with polkitd (Closes: #1018978)
+  * Backport patch for pcre2 replacement
+
+ -- Birger Schacht <birger@debian.org>  Fri, 09 Sep 2022 13:21:50 +0200
+
+sway (1.7-3) unstable; urgency=medium
+
+  * Backport patch to replace strncpy with memcpy (Closes: #1013044)
+  * Backport patch to remove buffer destruction condition in swaynag
+  * Bump standards-version to 4.6.1.0 (no changes required)
+
+ -- Birger Schacht <birger@debian.org>  Mon, 25 Jul 2022 15:57:32 +0200
+
+sway (1.7-2) unstable; urgency=medium
+
+  * Upload to unstable (Closes: #1008461)
+
+ -- Birger Schacht <birger@debian.org>  Fri, 01 Apr 2022 11:20:59 +0200
+
+sway (1.7-1) experimental; urgency=medium
+
+  * New upstream release.
+  * Bump min. version of wlroots build dependency to 0.15
+  * Bump min. version of wayland-protocols to 1.24
+  * Set min version of libwayland-dev to 1.20
+  * Drop filenamemangle option from d/watch
+  * Update patch for default configuration file
+  * Update year range in d/copyright stanza for debian/*
+
+ -- Birger Schacht <birger@debian.org>  Wed, 16 Feb 2022 10:00:35 +0100
+
+sway (1.6.1-2) unstable; urgency=medium
+
+  * Replace dependency on pcre with pcre2 (Closes: #999950)
+  * Upload to unstable
+  * Update year range in d/copyright stanza for debian/*
+
+ -- Birger Schacht <birger@debian.org>  Fri, 17 Dec 2021 07:42:23 +0100
+
+sway (1.6.1-1) experimental; urgency=medium
+
+  * New upstream release (Closes: #989274)
+  * Add libseat-dev to build-depends
+  * Bump min. version of wlroots build dependency to 0.14
+  * Bump standards-version to 4.6.0.1 (no changes required)
+  * Fix d/watch
+
+ -- Birger Schacht <birger@debian.org>  Thu, 18 Nov 2021 16:00:28 +0100
+
+sway (1.6-1) experimental; urgency=medium
+
+  * New upstream release (Closes: #986649)
+  * d/control:
+   + Bump min. version of wlroots build dependency to 0.13
+
+ -- Birger Schacht <birger@debian.org>  Tue, 27 Apr 2021 17:50:54 +0200
+
+sway (1.5.1-2) unstable; urgency=medium
+
+  * Update dependency on wlroots (0.12 or higher)
+  * d/gbp.conf: Update debian-branch.
+
+ -- nicoo <nicoo@debian.org>  Sun, 14 Feb 2021 12:36:51 +0100
+
+sway (1.5.1-1) experimental; urgency=medium
+
+  * New upstream release
+    Compatible with wlroots v0.12
+
+  * Update nicoo's name
+  * d/upstream: Update signing key
+  * d/gbp.conf: Update debian-branch for experimental
+
+ -- nicoo <nicoo@debian.org>  Wed, 03 Feb 2021 18:42:21 +0100
+
+sway (1.5-7) unstable; urgency=medium
+
+  * Upload to unstable with new package `grimshot`
+  * Add Bug-Tracking information to d/upstream/metadata
+  * Drop config snippet that sets the default term and set this
+    in the default configuration instead
+  * Add d/sway.maintscript to remove obsolete config file
+  * Add a config file to set environment variables in systemd
+    environment
+
+ -- Birger Schacht <birger@debian.org>  Thu, 05 Nov 2020 22:40:59 +0100
+
+sway (1.5-6) experimental; urgency=medium
+
+  * Add a new binary package that contains the `grimshot` script
+    and its documentation from the contrib folder (Closes: #960044)
+
+ -- Birger Schacht <birger@debian.org>  Tue, 03 Nov 2020 20:37:56 +0100
+
+sway (1.5-5) unstable; urgency=medium
+
+  * Only recommend foot, so users have a usable sway config
+    on installation (Closes: #972569)
+  * Add xdg-desktop-portal-wlr to suggestions
+  * Add support for overriding configfile variables in default
+    config (Closes: #969427)
+  * Drop patch that hardcodes `foot` as term
+  * Add a config file overriding the default $term variable
+    and setting it to foot
+
+ -- Birger Schacht <birger@debian.org>  Sun, 25 Oct 2020 13:38:25 +0100
+
+sway (1.5-4) unstable; urgency=medium
+
+  * d/control: do not use a virtual package as primary
+    recommendation (Closes: #972199)
+  * d/patches: set default terminal to foot in the system wide
+    configuration file
+
+ -- Birger Schacht <birger@debian.org>  Wed, 14 Oct 2020 20:48:12 +0200
+
+sway (1.5-3) unstable; urgency=medium
+
+  * Add policykit-1 to dependencies (Closes: #968643)
+
+ -- Birger Schacht <birger@debian.org>  Sun, 23 Aug 2020 10:44:15 +0200
+
+sway (1.5-2) unstable; urgency=medium
+
+  * Upload to unstable (Closes: #965337)
+
+ -- Birger Schacht <birger@debian.org>  Fri, 24 Jul 2020 17:42:00 +0200
+
+sway (1.5-1) experimental; urgency=medium
+
+  * Upload to experimental
+  * New upstream version
+  * d/control
+   + Update uploader address
+   + Bump min. version of wlroots build dependency to 0.11.0
+   + Bump debhelper-compat version to 13
+  * Update d/copyright
+
+ -- Birger Schacht <birger@debian.org>  Tue, 21 Jul 2020 09:00:51 +0200
+
+sway (1.4-2) unstable; urgency=medium
+
+  * Source only upload as-is.
+
+ -- Birger Schacht <birger@rantanplan.org>  Mon, 17 Feb 2020 22:14:32 +0100
+
+sway (1.4-1) unstable; urgency=medium
+
+  * New upstream version (Closes: #949984)
+  * Upload to unstable, now that wlroots is in unstable
+  * d/control:
+    - Bump version of wlroots build dependency to 0.10.0
+    - Bump standards version to 4.5.0 (no changes required)
+  * d/patches:
+    - Update 0001-Install-zsh-completions-into-the-correct-directory.patch
+    - Replace 0002-Replace-urxvt-with-x-terminal-emulator.patch with
+      0002-Replace-default-terminal-with-x-terminal-emulator.patch
+  * d/sway.install
+    - Update path of fish completions
+
+ -- Birger Schacht <birger@rantanplan.org>  Wed, 05 Feb 2020 09:32:26 +0100
+
+sway (1.2-1) experimental; urgency=medium
+
+  * New upstream version (Closes: #940862)
+  * d/control:
+    - Bump version of wlroots build dependency to 0.7.0-2
+      (new upstream version need wlroots 0.7.0)
+    - Bump standards version to 4.4.0 (no changes required to
+      make package compliant)
+    - Set maintainer field to new team address and add nicoo to
+      uploaders
+  * d/patches:
+    - Drop patch setting the project version - upstream fixed
+      it in meson.build
+  * d/rules:
+    - Set DEB_CFLAGS_MAINT_APPEND so we don't fail on deprecation warnings
+      This is a workaround for https://github.com/swaywm/sway/issues/4553
+  * d/gitlab-ci.yml:
+    - Added configuration file for gitlab ci
+
+ -- Birger Schacht <birger@rantanplan.org>  Fri, 27 Sep 2019 08:58:00 +0200
+
+sway (1.1.1-1) experimental; urgency=medium
+
+  * New upstream version (Closes: #927723)
+  * d/control:
+   - Add swaybg to dependencies as proposed by upstream
+     ("swaybg is a required dependency of sway")
+   - Add suckless-tools and x-terminal-emulator to Recommends,
+     because the default sway config uses dmenu(1) (Closes: #924063)
+   - Remove workaround for libwlroots run dependency from Depends:
+     field. Since libwlroots1 we can rely on dpkg-shlibdeps
+   - Make build-deps libsystemd-dev and libelogind-dev alternatives
+   - Set meson version for build-dep like upstream
+     does in meson.build (Closes: #927915)
+   - Add libgl1-mesa-dri as dependency (Closes: #927990)
+   - Set strict version of libwlroots dependency: the library breaks
+     ABI between versions so we need the right version for building sway
+   - Run wrap-and-sort on d/control
+   - Add missing build-dependencies: libevdev-dev, libpixman-1-dev,
+     libwayland-egl1 and libxbcommon-dev
+
+  * d/patches
+   - Add patch to install zsh completions into correct directory
+     (Closes: #922777)
+   - Add patch to replace urxvt in the default config file with
+     x-terminal-emulator
+   - Add patch to use the correct version string
+
+  * d/copyright
+   - Add missing files
+   - Bump copyright years on debian/
+
+  * d/sway.install
+   - Add directory for manpages in section 7
+   - Update path of zsh completions directory
+
+ -- Birger Schacht <birger@rantanplan.org>  Sun, 09 Jun 2019 07:38:17 +0200
+
+sway (1.0~rc3-1) experimental; urgency=medium
+
+  * New upstream version
+
+ -- Birger Schacht <birger@rantanplan.org>  Tue, 19 Feb 2019 13:28:38 +0100
+
+sway (1.0~rc2-1) experimental; urgency=medium
+
+  * New upstream version
+  * d/rules: remove sway_version argument, as the version
+    is now set in the build file
+
+ -- Birger Schacht <birger@rantanplan.org>  Tue, 12 Feb 2019 19:49:19 +0100
+
+sway (1.0~rc1-1) experimental; urgency=medium
+
+  * New upstream release
+  * Remove swaylock and swayidle: they are now separate packages
+  * Tidied up d/sway.install: now that swaylock and swayidle
+    are separate source packages, its easier to use wildcards
+  * Specify versioned build-dependencies as required by upstream.
+    Thus explicitly listing wayland-protocols and libsystemd as
+    build-dep with versions and adding versions to scdoc build-dep.
+  * Adding libelogind build-dep
+  * Bump version of libwlroots-dev build-dep
+  * Remove references to swaygrab (it was removed from the upstream
+    package; see grim(1) for an alternative)
+  * Update Recommends and Suggests: one of the sway wallpapers is
+    configured as background in the shipped config file, thus the
+    package containing the wallpapers is recommended. swayidle and
+    swaylock are also configured in the shipped config file, but
+    commented, thus they are only suggested
+  * Make versioned run dependency on libwlroots0 explicit
+
+ -- Birger Schacht <birger@rantanplan.org>  Sun, 10 Feb 2019 09:48:12 +0100
+
+sway (1.0~beta.2-3) experimental; urgency=medium
+
+  * Try upload again.
+
+ -- Birger Schacht <birger@rantanplan.org>  Thu, 31 Jan 2019 12:57:01 +0100
+
+sway (1.0~beta.2-2) experimental; urgency=medium
+
+  * Fixed license identifier in d/copyright
+
+ -- Birger Schacht <birger@rantanplan.org>  Wed, 30 Jan 2019 23:26:43 +0100
+
+sway (1.0~beta.2-1) experimental; urgency=medium
+
+  [ nicoo & Birger Schacht ]
+  * Initial packaging (Closes: 897246, 821397)
+
+ -- Birger Schacht <birger@rantanplan.org>  Wed, 30 Jan 2019 21:11:27 +0100

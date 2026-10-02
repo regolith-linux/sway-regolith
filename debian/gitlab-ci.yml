@@ -1,0 +1,8 @@
+---
+include: 
+ - https://salsa.debian.org/salsa-ci-team/pipeline/raw/master/recipes/debian.yml
+
+variables:
+  # For Salsa CI to also extract the upstream tarball when using the
+  # export-dir option, gbp buildpackage needs the --git-overlay option set.
+  SALSA_CI_GBP_BUILDPACKAGE_ARGS: "--git-overlay"
