@@ -17,6 +17,7 @@ Build-Depends:
  libpixman-1-dev,
  libseat-dev,
  libsystemd-dev (>= 239) | libelogind-dev (>= 239),
+ libtrawldb,
  libwayland-dev (>= 1.21.0),
  libwlroots-0.20-dev (>= 0.20.0),
  libxkbcommon-dev (>= 1.5.0),
@@ -35,6 +36,7 @@ Architecture: any
 Depends:
  libgl1-mesa-dri,
  swaybg,
+ libtrawldb,
  ${misc:Depends},
  ${shlibs:Depends},
 Recommends:
