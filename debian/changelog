@@ -1,3 +1,11 @@
+sway-regolith (1.12-1) unstable; urgency=medium
+
+  * Adopt Debian's sway 1.12-1 packaging with Regolith patches:
+    trawl integration, swaybar dbusmenu tray, reproducible version,
+    and stock config/session removal.
+
+ -- Soumya Ranjan Patnaik <soumya.patnaik@canonical.com>  Sat, 03 Oct 2026 00:35:26 +0530
+
 sway (1.12-1) unstable; urgency=medium
 
   * New upstream release

@@ -1,9 +1,6 @@
-Source: sway
+Source: sway-regolith
 Section: x11
-Maintainer: Sway and related packages team <team+swaywm@tracker.debian.org>
-Uploaders:
- Birger Schacht <birger@debian.org>,
- nicoo <nicoo@debian.org>,
+Maintainer: Soumya Ranjan Patnaik <soumyaranjan1812@gmail.com>
 Build-Depends:
  debhelper-compat (= 13),
  libcairo2-dev,
@@ -28,10 +25,8 @@ Build-Depends:
  wayland-protocols (>= 1.41),
 Standards-Version: 4.7.4
 Homepage: https://swaywm.org
-Vcs-Browser: https://salsa.debian.org/swaywm-team/sway
-Vcs-Git: https://salsa.debian.org/swaywm-team/sway.git
 
-Package: sway
+Package: sway-regolith
 Architecture: any
 Depends:
  libgl1-mesa-dri,
@@ -49,11 +44,15 @@ Suggests:
  swaylock,
  xdg-desktop-portal-gtk,
  xdg-desktop-portal-wlr,
-Description: i3-compatible Wayland compositor
+Provides: sway
+Conflicts: sway
+Replaces: sway
+Description: i3-compatible Wayland compositor for the Regolith desktop environment
  sway (SirCmpwn's Wayland compositor) is a tiling Wayland compositor and a
  drop-in replacement for the i3 window manager for X11. It works with your
  existing i3 configuration and supports most of i3's features, plus a few
- extras. This means it is a minimalist, tiling window manager.
+ extras. This means it is a minimalist, tiling window manager.  This variant
+ supports trawl integration.
 
 Package: sway-backgrounds
 Architecture: all
@@ -62,7 +61,7 @@ Depends:
  ${misc:Depends},
  ${shlibs:Depends},
 Suggests:
- sway,
+ sway-regolith,
 Description: Set of backgrounds packaged with the sway window manager
  sway (SirCmpwn's Wayland compositor) is a tiling Wayland compositor and a
  drop-in replacement for the i3 window manager for X11. It works with your
