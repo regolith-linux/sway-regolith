@@ -53,19 +53,3 @@ Description: i3-compatible Wayland compositor for the Regolith desktop environme
  existing i3 configuration and supports most of i3's features, plus a few
  extras. This means it is a minimalist, tiling window manager.  This variant
  supports trawl integration.
-
-Package: sway-backgrounds
-Architecture: all
-Multi-Arch: foreign
-Depends:
- ${misc:Depends},
- ${shlibs:Depends},
-Suggests:
- sway-regolith,
-Description: Set of backgrounds packaged with the sway window manager
- sway (SirCmpwn's Wayland compositor) is a tiling Wayland compositor and a
- drop-in replacement for the i3 window manager for X11. It works with your
- existing i3 configuration and supports most of i3's features, plus a few
- extras. This means it is a minimalist, tiling window manager.
- .
- This package contains a set of desktop backgrounds that come with sway.

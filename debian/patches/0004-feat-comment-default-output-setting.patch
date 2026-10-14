@@ -14,7 +14,7 @@ diff --git a/config.in b/config.in
 index a2a01dda..87755981 100644
 --- a/config.in
 +++ b/config.in
-@@ -21,7 +21,10 @@ set $menu wmenu-run
+@@ -23,7 +23,10 @@ set $menu wmenu-run
  ### Output configuration
  #
  # Default wallpaper (more resolutions are available in @datadir@/backgrounds/sway/)

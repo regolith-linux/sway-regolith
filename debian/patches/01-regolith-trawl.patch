@@ -9,7 +9,7 @@ Index: sway-regolith/meson.build
  	'c',
  	version: '1.12',
  	license: 'MIT',
-@@ -80,6 +80,7 @@ math = cc.find_library('m')
+@@ -81,6 +81,7 @@ math = cc.find_library('m')
  rt = cc.find_library('rt')
  xcb_icccm = wlroots_features['xwayland'] ? dependency('xcb-icccm') : null_dep
  threads = dependency('threads') # for pthread_setschedparam and pthread_atfork
@@ -21,63 +21,97 @@ Index: sway-regolith/sway/commands/set_from_resource.c
 ===================================================================
 --- /dev/null
 +++ sway-regolith/sway/commands/set_from_resource.c
-@@ -0,0 +1,47 @@
+@@ -0,0 +1,79 @@
 +#define _POSIX_C_SOURCE 200809L
 +#include "log.h"
 +#include "stringop.h"
 +#include "sway/commands.h"
 +#include "sway/config.h"
 +#include <trawldb/client_api.h>
-+#include <stdio.h>
++#include <stdlib.h>
 +#include <string.h>
-+#include <strings.h>
++
++// One trawl proxy per config load, shared by all set_from_resource
++// directives of that load and released when the load ends. A proxy per
++// directive leaked every proxy (and its cached copy of all resources) on
++// each load. A proxy kept for the life of the process breaks when trawld
++// restarts: sway runs no GLib main loop, so the proxy never sees the bus name
++// move to the new trawld and keeps calling the old one, and every later
++// lookup fails.
++static conf_client trawl_proxy = NULL;
++
++void set_from_resource_end_config_load(void) {
++	g_clear_object(&trawl_proxy);
++}
++
++// Returns the resource value (caller frees) or NULL if trawl is unavailable,
++// the lookup failed or the value is empty.
++static char *fetch_resource(char *key) {
++	GError *err = NULL;
++	if (!trawl_proxy && !conf_client_init(&trawl_proxy, &err)) {
++		sway_log(SWAY_DEBUG, "set_from_resource: trawl unavailable: %s",
++			err ? err->message : "unknown error");
++		g_clear_error(&err);
++		g_clear_object(&trawl_proxy);
++		return NULL;
++	}
++
++	char *value = NULL;
++	bool found = conf_client_get(trawl_proxy, key, &value, &err);
++	if (!config->reading) {
++		// A runtime command, not part of a config load.
++		set_from_resource_end_config_load();
++	}
++	if (!found) {
++		sway_log(SWAY_DEBUG, "set_from_resource: lookup of '%s' failed: %s",
++			key, err ? err->message : "unknown error");
++		g_clear_error(&err);
++		g_free(value);
++		return NULL;
++	}
++	if (value && value[0] == '\0') {
++		g_free(value);
++		return NULL;
++	}
++	return value;
++}
 +
 +struct cmd_results *cmd_set_from_resource(int argc, char **argv) {
-+  struct cmd_results *error = NULL;
-+  if ((error = checkarg(argc, "set", EXPECTED_AT_LEAST, 2))) {
-+    return error;
-+  }
-+  if (argv[0][0] != '$') {
-+    return cmd_results_new(CMD_INVALID, "variable '%s' must start with $",
-+                           argv[0]);
-+  }
++	struct cmd_results *error = NULL;
++	if ((error = checkarg(argc, "set_from_resource", EXPECTED_AT_LEAST, 2))) {
++		return error;
++	}
++	if (argv[0][0] != '$') {
++		return cmd_results_new(CMD_INVALID, "variable '%s' must start with $",
++			argv[0]);
++	}
 +
-+  conf_client proxy = NULL;
-+  GError *err = NULL;
-+  conf_client_init(&proxy, &err);
++	char *value = fetch_resource(argv[1]);
++	if (!value) {
++		if (argc < 3) {
++			return cmd_results_new(CMD_FAILURE,
++				"failed to fetch value of resource '%s' and "
++				"fallback value not provided", argv[1]);
++		}
++		value = join_args(argv + 2, argc - 2);
++	}
 +
-+  char *resource_value = NULL;
-+  conf_client_get(proxy, argv[1], &resource_value, &err);
-+
-+  if (err || resource_value == NULL || strlen(resource_value) == 0) {
-+    if (argc < 3) {
-+      return cmd_results_new(CMD_FAILURE,
-+                             "failed to fetch value of resource '%s' and "
-+                             "fallback value not provided",
-+                             argv[1]);
-+    }
-+    resource_value = join_args(argv + 2, argc - 2);
-+  }
-+  char **argv_new = calloc(argc - 1, sizeof(char *));
-+  argv_new[0] = strdup(argv[0]);
-+  for (int i = 2; i < argc; i++) {
-+    argv_new[i - 1] = argv[i];
-+  }
-+
-+  argv_new[1] = strdup(resource_value);
-+
-+  free(resource_value);
-+  return cmd_set(2, argv_new);
++	char *set_argv[] = { argv[0], value };
++	struct cmd_results *res = cmd_set(2, set_argv);
++	free(value);
++	return res;
 +}
 Index: sway-regolith/include/sway/commands.h
 ===================================================================
 --- sway-regolith.orig/include/sway/commands.h
 +++ sway-regolith/include/sway/commands.h
-@@ -173,6 +173,7 @@ sway_cmd cmd_resize;
+@@ -173,6 +173,9 @@ sway_cmd cmd_resize;
  sway_cmd cmd_scratchpad;
  sway_cmd cmd_seamless_mouse;
  sway_cmd cmd_set;
 +sway_cmd cmd_set_from_resource;
++// Releases the trawl proxy that set_from_resource shares within a config load.
++void set_from_resource_end_config_load(void);
  sway_cmd cmd_shortcuts_inhibitor;
  sway_cmd cmd_show_marks;
  sway_cmd cmd_smart_borders;
@@ -142,7 +176,7 @@ Index: sway-regolith/sway/meson.build
  	'commands/show_marks.c',
  	'commands/shortcuts_inhibitor.c',
  	'commands/smart_borders.c',
-@@ -234,6 +235,7 @@ sway_deps = [
+@@ -235,6 +236,7 @@ sway_deps = [
  	xkbcommon,
  	xcb,
  	xcb_icccm,
@@ -150,3 +184,15 @@ Index: sway-regolith/sway/meson.build
  ]
  
  if wlroots_features['xwayland']
+Index: sway-regolith/sway/config.c
+===================================================================
+--- sway-regolith.orig/sway/config.c
++++ sway-regolith/sway/config.c
+@@ -506,6 +506,7 @@ bool load_main_config(const char *file,
+ 	config->reading = true;
+ 
+ 	bool success = load_config(path, config, &config->swaynag_config_errors);
++	set_from_resource_end_config_load();
+ 
+ 	if (validating) {
+ 		free_config(config);

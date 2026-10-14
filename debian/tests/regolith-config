@@ -1,0 +1,13 @@
+#!/bin/sh
+# Regolith's sway config validates with the default look loaded into trawl,
+# as the Regolith session does before starting sway.
+set -eu
+. debian/tests/lib-headless.sh
+in_dbus_session "$@"
+setup_runtime
+start_trawld
+
+load_resources /usr/share/regolith-look/default/root wm.client.focused.color.child_border
+sway -C -c /etc/regolith/sway/config
+
+echo "PASS: regolith-config"
