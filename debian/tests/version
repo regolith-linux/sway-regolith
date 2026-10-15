@@ -1,0 +1,9 @@
+#!/bin/sh
+# 02-version-fix: the version string is the plain release, no git hash.
+set -eu
+
+out=$(sway --version)
+echo "$out"
+[ "$out" = "sway version 1.11" ] || { echo "FAIL: unexpected version string"; exit 1; }
+
+echo "PASS: version"
