@@ -23,6 +23,7 @@ Build-Depends:
  scdoc (>= 1.9.2),
  tree,
  wayland-protocols (>= 1.24),
+ xkb-data,
 Standards-Version: 4.7.0
 Rules-Requires-Root: no
 
