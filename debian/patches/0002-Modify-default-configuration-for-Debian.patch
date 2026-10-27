@@ -1,0 +1,27 @@
+From 00ef8f7ee61e3399a663bbe0e3d6ffa62513d9ab Mon Sep 17 00:00:00 2001
+From: Birger Schacht <birger@debian.org>
+Date: Sun, 29 Sep 2024 19:52:43 +0200
+Subject: [PATCH] Modify default configuration for Debian
+
+Include another directory to be able to override the variables set at
+the beginning of the configuration file.
+---
+ config.in | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/config.in b/config.in
+index a2a01dda..e5584cec 100644
+--- a/config.in
++++ b/config.in
+@@ -18,6 +18,8 @@ set $term foot
+ # Your preferred application launcher
+ set $menu wmenu-run
+ 
++include /etc/sway/config-vars.d/*
++
+ ### Output configuration
+ #
+ # Default wallpaper (more resolutions are available in @datadir@/backgrounds/sway/)
+-- 
+2.45.2
+

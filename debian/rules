@@ -1,0 +1,46 @@
+#!/usr/bin/make -f
+# -*- makefile -*-
+
+export DH_VERBOSE=1
+export DH_OPTIONS=-v
+
+include /usr/share/dpkg/pkg-info.mk
+include /usr/share/dpkg/architecture.mk
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+export DEB_CFLAGS_MAINT_APPEND = -Wno-error=deprecated-declarations
+
+%:
+	dh $@
+
+.PHONY: override_dh_auto_configure
+override_dh_auto_configure:
+	dh_auto_configure -- --libexecdir=lib -Ddefault-wallpaper=false
+
+.PHONY: override_dh_auto_install
+override_dh_auto_install:
+	dh_auto_install --destdir=debian/tmp
+
+.PHONY: override_dh_missing
+override_dh_missing:
+	dh_missing --fail-missing
+
+.PHONY: override_dh_install
+override_dh_install:
+	if ! dh_install; then \
+		tree debian/tmp;    \
+    exit 1;             \
+	fi
+
+.PHONY: override_dh_auto_test
+override_dh_auto_test:
+	dh_auto_test
+ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
+	sh debian/tests/set-from-resource-fallback.sh obj-$(DEB_HOST_GNU_TYPE)/sway/sway
+endif
+
+.PHONY: override_dh_builddeb
+override_dh_builddeb:
+	dh_builddeb
+ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
+	sh debian/tests/no-sway-config ../sway-regolith_$(DEB_VERSION)_$(DEB_HOST_ARCH).deb
+endif
