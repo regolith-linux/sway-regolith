@@ -6,6 +6,7 @@ export DH_OPTIONS=-v
 
 include /usr/share/dpkg/pkg-info.mk
 include /usr/share/dpkg/architecture.mk
+include /usr/share/dpkg/buildtools.mk
 export DEB_BUILD_MAINT_OPTIONS = hardening=+all
 export DEB_CFLAGS_MAINT_APPEND = -Wno-error=deprecated-declarations
 
@@ -22,11 +23,17 @@ override_dh_missing:
 
 # 01-regolith-trawl: set_from_resource must fall back cleanly when trawl is
 # unreachable (no session bus here), with GLib criticals made fatal.
+# 06-keybindings-us-fallback: unit check of the non-Latin layout fallback.
 .PHONY: override_dh_auto_test
 override_dh_auto_test:
 	dh_auto_test
 ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
 	sh debian/tests/set-from-resource-fallback.sh obj-$(DEB_HOST_GNU_TYPE)/sway/sway
+	# 06-keybindings-us-fallback: layouts without Latin letters and US keysyms
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Iinclude -o obj-$(DEB_HOST_GNU_TYPE)/keyboard-latin-test \
+		debian/tests/keyboard-latin.c sway/input/keyboard_latin.c \
+		$$(pkg-config --cflags --libs xkbcommon) $(LDFLAGS)
+	obj-$(DEB_HOST_GNU_TYPE)/keyboard-latin-test
 endif
 
 .PHONY: override_dh_install

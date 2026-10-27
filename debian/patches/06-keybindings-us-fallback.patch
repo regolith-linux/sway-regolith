@@ -1,0 +1,260 @@
+Description: match key bindings by US key positions in non-Latin layouts
+ Plain bindsym bindings match the keysyms of the active layout, so in a
+ Russian, Greek or other non-Latin layout no letter binding (Mod4+z, ...)
+ can match. GNOME handles this in mutter (needs_secondary_layout): when the
+ active layout lacks one of the letters a-z on its first level, key bindings
+ are also looked up in the US layout. Do the same here: when no binding
+ matched and the key's layout lacks Latin letters, try the keysyms the key
+ has on the first level of the US layout, with the raw modifiers.
+ Layouts with Latin letters (us, de, fr, dvorak, ...) are not affected.
+Author: rego-port-bot <339843353+rego-port-bot@users.noreply.github.com>
+Forwarded: no
+Last-Update: 2026-10-27
+Index: sway-regolith/sway/meson.build
+===================================================================
+--- sway-regolith.orig/sway/meson.build
++++ sway-regolith/sway/meson.build
+@@ -26,6 +26,7 @@
+ 	'input/input-manager.c',
+ 	'input/cursor.c',
+ 	'input/keyboard.c',
++	'input/keyboard_latin.c',
+ 	'input/seat.c',
+ 	'input/seatop_default.c',
+ 	'input/seatop_down.c',
+Index: sway-regolith/include/sway/input/keyboard.h
+===================================================================
+--- sway-regolith.orig/include/sway/input/keyboard.h
++++ sway-regolith/include/sway/input/keyboard.h
+@@ -63,12 +63,18 @@
+ 
+ 	struct sway_shortcut_state state_keysyms_translated;
+ 	struct sway_shortcut_state state_keysyms_raw;
++	struct sway_shortcut_state state_keysyms_latin;
+ 	struct sway_shortcut_state state_keycodes;
+ 	struct sway_shortcut_state state_pressed_sent;
+ 	struct sway_binding *held_binding;
+ 
+ 	struct wl_event_source *key_repeat_source;
+ 	struct sway_binding *repeat_binding;
++
++	// Whether the layout last checked lacks Latin letters (see keyboard_latin.h)
++	struct xkb_keymap *latin_checked_keymap;
++	xkb_layout_index_t latin_checked_layout;
++	bool latin_fallback;
+ };
+ 
+ struct sway_keyboard_group {
+Index: sway-regolith/include/sway/input/keyboard_latin.h
+===================================================================
+--- /dev/null
++++ sway-regolith/include/sway/input/keyboard_latin.h
+@@ -0,0 +1,30 @@
++#ifndef _SWAY_INPUT_KEYBOARD_LATIN_H
++#define _SWAY_INPUT_KEYBOARD_LATIN_H
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <xkbcommon/xkbcommon.h>
++
++/**
++ * Key bindings in layouts without Latin letters, as GNOME does it.
++ *
++ * Plain bindsym bindings match the keysyms of the active layout, so in a
++ * Russian or Greek layout no letter binding (Mod4+z, ...) can match. GNOME
++ * (mutter's needs_secondary_layout) then also looks the key up in the US
++ * layout. These helpers provide the same check and lookup.
++ */
++
++/**
++ * Whether the layout lacks one of the letters a-z on its first level.
++ */
++bool keyboard_layout_lacks_latin(struct xkb_keymap *keymap,
++		xkb_layout_index_t layout);
++
++/**
++ * The first-level keysyms the key has in the US layout. The key is found by
++ * name, so this works for any keymap. Returns the number of keysyms.
++ */
++size_t keyboard_latin_keysyms(struct xkb_keymap *keymap,
++		xkb_keycode_t keycode, const xkb_keysym_t **keysyms);
++
++#endif
+Index: sway-regolith/sway/input/keyboard.c
+===================================================================
+--- sway-regolith.orig/sway/input/keyboard.c
++++ sway-regolith/sway/input/keyboard.c
+@@ -11,6 +11,7 @@
+ #include "sway/commands.h"
+ #include "sway/input/input-manager.h"
+ #include "sway/input/keyboard.h"
++#include "sway/input/keyboard_latin.h"
+ #include "sway/input/seat.h"
+ #include "sway/input/cursor.h"
+ #include "sway/ipc-server.h"
+@@ -355,6 +356,28 @@
+ 		keycode, layout_index, 0, keysyms);
+ }
+ 
++/**
++ * Whether bindings should also be matched against the key's US keysyms:
++ * true when the key's current layout lacks Latin letters, as in GNOME.
++ */
++static bool keyboard_use_latin_fallback(struct sway_keyboard *keyboard,
++		xkb_keycode_t keycode) {
++	struct xkb_keymap *keymap = keyboard->wlr->keymap;
++	xkb_layout_index_t layout = xkb_state_key_get_layout(
++		keyboard->wlr->xkb_state, keycode);
++	if (!keymap || layout == XKB_LAYOUT_INVALID) {
++		return false;
++	}
++	if (keyboard->latin_checked_keymap != keymap ||
++			keyboard->latin_checked_layout != layout) {
++		keyboard->latin_checked_keymap = keymap;
++		keyboard->latin_checked_layout = layout;
++		keyboard->latin_fallback =
++			keyboard_layout_lacks_latin(keymap, layout);
++	}
++	return keyboard->latin_fallback;
++}
++
+ void sway_keyboard_disarm_key_repeat(struct sway_keyboard *keyboard) {
+ 	if (!keyboard) {
+ 		return;
+@@ -376,6 +399,10 @@
+ 	const xkb_keysym_t *translated_keysyms;
+ 	uint32_t translated_modifiers;
+ 	size_t translated_keysyms_len;
++
++	bool use_latin;
++	const xkb_keysym_t *latin_keysyms;
++	size_t latin_keysyms_len;
+ };
+ 
+ static void update_keyboard_state(struct sway_keyboard *keyboard,
+@@ -393,6 +420,12 @@
+ 
+ 	keyinfo->code_modifiers = wlr_keyboard_get_modifiers(keyboard->wlr);
+ 
++	keyinfo->use_latin = keyboard_use_latin_fallback(keyboard,
++			keyinfo->keycode);
++	keyinfo->latin_keysyms_len = keyboard->wlr->keymap ?
++		keyboard_latin_keysyms(keyboard->wlr->keymap, keyinfo->keycode,
++			&keyinfo->latin_keysyms) : 0;
++
+ 	// Update shortcut model keyinfo
+ 	update_shortcut_state(&keyboard->state_keycodes, raw_keycode, keystate,
+ 			keyinfo->keycode, keyinfo->code_modifiers);
+@@ -406,6 +439,11 @@
+ 				raw_keycode, keystate, keyinfo->translated_keysyms[i],
+ 				keyinfo->code_modifiers);
+ 	}
++	for (size_t i = 0; i < keyinfo->latin_keysyms_len; ++i) {
++		update_shortcut_state(&keyboard->state_keysyms_latin,
++				raw_keycode, keystate, keyinfo->latin_keysyms[i],
++				keyinfo->code_modifiers);
++	}
+ }
+ 
+ /**
+@@ -470,6 +508,14 @@
+ 			keyinfo.translated_modifiers, true, locked,
+ 			shortcuts_inhibited, device_identifier,
+ 			exact_identifier, keyboard->effective_layout);
++	// In a layout without Latin letters, also try the key's US keysyms
++	if (!binding_released && keyinfo.use_latin) {
++		get_active_binding(&keyboard->state_keysyms_latin,
++				config->current_mode->keysym_bindings, &binding_released,
++				keyinfo.raw_modifiers, true, locked,
++				shortcuts_inhibited, device_identifier,
++				exact_identifier, keyboard->effective_layout);
++	}
+ 
+ 	// Execute stored release binding once no longer active
+ 	if (keyboard->held_binding && binding_released != keyboard->held_binding &&
+@@ -502,6 +548,13 @@
+ 				keyinfo.translated_modifiers, false, locked,
+ 				shortcuts_inhibited, device_identifier,
+ 				exact_identifier, keyboard->effective_layout);
++		if (!binding && keyinfo.use_latin) {
++			get_active_binding(&keyboard->state_keysyms_latin,
++					config->current_mode->keysym_bindings, &binding,
++					keyinfo.raw_modifiers, false, locked,
++					shortcuts_inhibited, device_identifier,
++					exact_identifier, keyboard->effective_layout);
++		}
+ 	}
+ 
+ 	// Set up (or clear) keyboard repeat for a pressed binding. Since the
+@@ -1019,6 +1072,7 @@
+ 		xkb_keymap_unref(keyboard->keymap);
+ 		keyboard->keymap = keymap;
+ 		keyboard->effective_layout = 0;
++		keyboard->latin_checked_keymap = NULL;
+ 
+ 		sway_keyboard_group_remove_invalid(keyboard);
+ 		wlr_keyboard_set_keymap(keyboard->wlr, keyboard->keymap);
+Index: sway-regolith/sway/input/keyboard_latin.c
+===================================================================
+--- /dev/null
++++ sway-regolith/sway/input/keyboard_latin.c
+@@ -0,0 +1,59 @@
++#include <stdbool.h>
++#include <xkbcommon/xkbcommon.h>
++#include <xkbcommon/xkbcommon-keysyms.h>
++#include "sway/input/keyboard_latin.h"
++
++bool keyboard_layout_lacks_latin(struct xkb_keymap *keymap,
++		xkb_layout_index_t layout) {
++	bool found[XKB_KEY_z - XKB_KEY_a + 1] = { false };
++	int missing = XKB_KEY_z - XKB_KEY_a + 1;
++	xkb_keycode_t min = xkb_keymap_min_keycode(keymap);
++	xkb_keycode_t max = xkb_keymap_max_keycode(keymap);
++	for (xkb_keycode_t keycode = min; keycode <= max && missing > 0; keycode++) {
++		if (layout >= xkb_keymap_num_layouts_for_key(keymap, keycode)) {
++			continue;
++		}
++		const xkb_keysym_t *syms;
++		int n = xkb_keymap_key_get_syms_by_level(keymap, keycode, layout, 0,
++				&syms);
++		for (int i = 0; i < n; i++) {
++			if (syms[i] >= XKB_KEY_a && syms[i] <= XKB_KEY_z &&
++					!found[syms[i] - XKB_KEY_a]) {
++				found[syms[i] - XKB_KEY_a] = true;
++				missing--;
++			}
++		}
++	}
++	return missing > 0;
++}
++
++static struct xkb_keymap *us_keymap(void) {
++	static struct xkb_keymap *keymap = NULL;
++	static bool tried = false;
++	if (!tried) {
++		tried = true;
++		struct xkb_context *context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
++		if (context) {
++			struct xkb_rule_names names = { .layout = "us" };
++			keymap = xkb_keymap_new_from_names(context, &names,
++					XKB_KEYMAP_COMPILE_NO_FLAGS);
++			xkb_context_unref(context);
++		}
++	}
++	return keymap;
++}
++
++size_t keyboard_latin_keysyms(struct xkb_keymap *keymap,
++		xkb_keycode_t keycode, const xkb_keysym_t **keysyms) {
++	struct xkb_keymap *us = us_keymap();
++	const char *name = xkb_keymap_key_get_name(keymap, keycode);
++	if (!us || !name) {
++		return 0;
++	}
++	xkb_keycode_t us_keycode = xkb_keymap_key_by_name(us, name);
++	if (us_keycode == XKB_KEYCODE_INVALID) {
++		return 0;
++	}
++	int n = xkb_keymap_key_get_syms_by_level(us, us_keycode, 0, 0, keysyms);
++	return n > 0 ? (size_t)n : 0;
++}
