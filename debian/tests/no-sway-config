@@ -1,0 +1,27 @@
+#!/bin/sh
+# 05-remove-config: no /etc/sway/config and no sway.desktop session file.
+# Also no sway default wallpapers, which belong to the distribution's
+# sway-backgrounds package (built with -Ddefault-wallpaper=false).
+# With a .deb argument (called from debian/rules) the archive is checked with
+# dpkg-deb -c; without one (autopkgtest) the installed package is checked.
+set -eu
+
+if [ $# -ge 1 ]; then
+	files=$(dpkg-deb -c "$1" | awk '{print $NF}' | sed 's|^\./|/|')
+else
+	files=$(dpkg -L sway-regolith)
+fi
+
+status=0
+for path in /etc/sway/config /usr/share/wayland-sessions/sway.desktop; do
+	if echo "$files" | grep -qx "$path"; then
+		echo "FAIL: package ships $path"
+		status=1
+	fi
+done
+if echo "$files" | grep -q '^/usr/share/backgrounds/'; then
+	echo "FAIL: package ships wallpapers under /usr/share/backgrounds"
+	status=1
+fi
+[ "$status" -eq 0 ] && echo "PASS: no-sway-config"
+exit "$status"

@@ -1,0 +1,23 @@
+#!/bin/sh
+# 01-regolith-trawl, live: a workspace name set from a trawl resource.
+set -eu
+. debian/tests/lib-headless.sh
+in_dbus_session "$@"
+setup_runtime
+start_trawld
+
+token="trawl-ws-$$"
+printf 'sway_regolith.test.workspace: %s\n' "$token" > "$WORK/resources"
+load_resources "$WORK/resources" sway_regolith.test.workspace
+
+cat > "$WORK/config" <<EOF
+set_from_resource \$ws sway_regolith.test.workspace fallback-ws
+workspace \$ws
+EOF
+start_sway "$WORK/config"
+
+names=$(swaymsg -t get_workspaces -r | jq -r '.[].name')
+echo "workspaces: $names"
+echo "$names" | grep -qx "$token" || fail "workspace '$token' from trawl not found"
+
+echo "PASS: trawl-live"

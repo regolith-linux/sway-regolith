@@ -1,0 +1,28 @@
+#!/bin/sh
+# 04-dbus-tray, smoke: swaybar with a tray starts and stays up.
+set -eu
+. debian/tests/lib-headless.sh
+in_dbus_session "$@"
+setup_runtime
+
+cat > "$WORK/config" <<'EOF'
+bar {
+    id tray-smoke
+    status_command while :; do date; sleep 1; done
+    tray_output *
+    tray_padding 2
+}
+EOF
+start_sway "$WORK/config"
+
+i=0
+until pgrep -x swaybar > /dev/null; do
+	i=$((i + 1))
+	[ "$i" -le 50 ] || { cat "$WORK/sway.log"; fail "swaybar did not start"; }
+	sleep 0.2
+done
+bar_pid=$(pgrep -x swaybar | head -n1)
+sleep 5
+kill -0 "$bar_pid" 2>/dev/null || { cat "$WORK/sway.log"; fail "swaybar exited"; }
+
+echo "PASS: tray-smoke"

@@ -1,0 +1,25 @@
+From 73b10519da7b850894cad2ce2192e8db8927b7c0 Mon Sep 17 00:00:00 2001
+From: Birger Schacht <birger@debian.org>
+Date: Sat, 23 Dec 2023 11:23:32 +0100
+Subject: [PATCH] Install zsh completions into the correct directory
+
+---
+ completions/meson.build | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/completions/meson.build b/completions/meson.build
+index 6bca9391..b31306eb 100644
+--- a/completions/meson.build
++++ b/completions/meson.build
+@@ -3,7 +3,7 @@ if get_option('zsh-completions')
+ 		'zsh/_sway',
+ 		'zsh/_swaymsg',
+ 	)
+-	zsh_install_dir = join_paths(datadir, 'zsh', 'site-functions')
++	zsh_install_dir = join_paths(datadir, 'zsh', 'vendor-completions')
+ 
+ 	install_data(zsh_files, install_dir: zsh_install_dir)
+ endif
+-- 
+2.43.0
+

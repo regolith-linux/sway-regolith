@@ -1,0 +1,8 @@
+debian/sway-portals.conf /usr/share/xdg-desktop-portal/
+usr/bin/sway*
+usr/share/bash-completion/completions/sway*
+usr/share/fish/vendor_completions.d/sway*
+usr/share/man/man1/sway*
+usr/share/man/man5/sway*
+usr/share/man/man7/sway*
+usr/share/zsh/vendor-completions/_sway*

@@ -1,0 +1,25 @@
+Tests: version
+Depends: sway-regolith
+
+Tests: no-sway-config
+Depends: sway-regolith
+
+Tests: trawl-live
+Depends: sway-regolith, trawld, trawldb, dbus, jq
+Restrictions: allow-stderr
+
+Tests: tray-smoke
+Depends: sway-regolith, dbus, procps
+Restrictions: allow-stderr
+
+Tests: regolith-config
+Depends: sway-regolith, regolith-wm-config, regolith-sway-root-config, regolith-look-default, trawld, trawldb, dbus, cpp
+Restrictions: allow-stderr
+
+Tests: trawl-reload-memory
+Depends: sway-regolith, trawld, trawldb, dbus, jq
+Restrictions: allow-stderr
+
+Tests: trawl-restart
+Depends: sway-regolith, trawld, trawldb, dbus, jq
+Restrictions: allow-stderr
