@@ -18,6 +18,8 @@ sway-regolith (1.12-1) stonking; urgency=medium
   * fix(04-dbus-tray): keep swaybar building with -Dtray=disabled
   * chore: restore the sway-regolith changelog history from
     packaging/v1.11-regolith in place of Debian's sway entries
+  * feat: add keyboard accessibility options (sticky, slow, bounce and mouse
+    keys)
 
  -- Soumya Ranjan Patnaik <soumyaranjan1812@gmail.com>  Wed, 14 Oct 2026 17:39:14 +0000
 
