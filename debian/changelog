@@ -1,3 +1,14 @@
+sway-regolith (1.11.2-1) resolute; urgency=medium
+
+  [ rego-port-bot ]
+  * test: check during the build that the package ships no sway config
+  * test: add autopkgtests for the Regolith patches
+  * test: guard against trawl proxy leaks on config reload
+  * test: check set_from_resource after trawld restarts
+  * feat: add keyboard accessibility options (sticky, slow, bounce and mouse keys)
+
+ -- Regolith Linux <regolith.linux@gmail.com>  Sat, 07 Nov 2026 09:22:14 -0800
+
 sway-regolith (1.11.1-1) resolute; urgency=medium
 
   [ rego-port-bot ]
