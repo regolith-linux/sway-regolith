@@ -9,3 +9,4 @@
 05-remove-config
 07-keyboard-accessibility.patch
 08-variable-command-name.patch
+09-workspace-name-hex-escape.patch

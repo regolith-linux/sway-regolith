@@ -27,3 +27,7 @@ Restrictions: allow-stderr
 Tests: variable-command-name
 Depends: sway-regolith, dbus
 Restrictions: allow-stderr
+
+Tests: workspace-name-hex-escape
+Depends: sway-regolith, trawld, trawldb, dbus, jq, wtype
+Restrictions: allow-stderr
