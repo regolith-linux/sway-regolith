@@ -10,5 +10,6 @@
 07-keyboard-accessibility.patch
 08-variable-command-name.patch
 09-workspace-name-hex-escape.patch
+10-bind-none-disables-binding.patch
 11-validate-included-configs.patch
 13-a11y-keyboard-monitor.patch
