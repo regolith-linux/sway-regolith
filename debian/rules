@@ -22,11 +22,13 @@ override_dh_missing:
 
 # 01-regolith-trawl: set_from_resource must fall back cleanly when trawl is
 # unreachable (no session bus here), with GLib criticals made fatal.
+# 11-validate-included-configs: sway -C fails on errors in included files.
 .PHONY: override_dh_auto_test
 override_dh_auto_test:
 	dh_auto_test
 ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
 	sh debian/tests/set-from-resource-fallback.sh obj-$(DEB_HOST_GNU_TYPE)/sway/sway
+	sh debian/tests/validate-includes.sh obj-$(DEB_HOST_GNU_TYPE)/sway/sway
 endif
 
 .PHONY: override_dh_install

@@ -10,3 +10,4 @@
 07-keyboard-accessibility.patch
 08-variable-command-name.patch
 09-workspace-name-hex-escape.patch
+11-validate-included-configs.patch
