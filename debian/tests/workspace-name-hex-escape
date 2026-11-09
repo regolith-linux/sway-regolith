@@ -1,0 +1,35 @@
+#!/bin/sh
+# 09-workspace-name-hex-escape: a workspace name from trawl that ends in \x
+# keeps it in a key binding, as in i3.
+set -eu
+. debian/tests/lib-headless.sh
+in_dbus_session "$@"
+setup_runtime
+start_trawld
+
+printf '%s\n' 'sway_regolith.test.ws: 1: three\x' > "$WORK/resources"
+load_resources "$WORK/resources" sway_regolith.test.ws
+
+cat > "$WORK/config" <<EOF2
+set_from_resource \$ws sway_regolith.test.ws fallback-ws
+bindsym Mod4+1 workspace \$ws
+EOF2
+start_sway "$WORK/config"
+
+for socket in "$XDG_RUNTIME_DIR"/wayland-*; do
+	case "$socket" in *.lock) continue ;; esac
+	export WAYLAND_DISPLAY="${socket##*/}"
+done
+wtype -M logo -k 1 -m logo
+
+i=0
+until swaymsg -t get_workspaces -r | jq -e '.[] | select(.focused and .name != "1")' > /dev/null; do
+	i=$((i + 1))
+	[ "$i" -le 25 ] || fail "the binding did not switch workspaces"
+	sleep 0.2
+done
+name=$(swaymsg -t get_workspaces -r | jq -r '.[] | select(.focused) | .name')
+echo "focused workspace: $name"
+[ "$name" = '1: three\x' ] || fail "expected workspace '1: three\\x', got '$name'"
+
+echo "PASS: workspace-name-hex-escape"
