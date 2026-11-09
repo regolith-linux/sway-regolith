@@ -1,0 +1,49 @@
+Description: Make sway -C fail when an included file has errors
+ sway -C logged the errors it found in files pulled in with include, but
+ only errors in the main file changed the exit status, so a broken
+ included file still passed the check. Regolith's sway configuration is
+ almost entirely made of included partials, which made sway -C of little
+ use for it. i3 -C fails in the same situation.
+ .
+ Errors in any file read while validating, the main one or an included
+ one at any depth, now make sway -C exit with status 1. The errors are
+ still reported with the included file's path and line number. Include
+ patterns that match nothing, directories and unreadable files, and files
+ already included stay non-fatal, as they are at run time. Starting
+ sway, the reload command and its validation step behave as before.
+Author: rego-port-bot <339843353+rego-port-bot@users.noreply.github.com>
+Bug: https://github.com/swaywm/sway/issues/6488
+Forwarded: https://github.com/swaywm/sway/pull/9330
+Last-Update: 2026-11-09
+---
+--- a/include/sway/config.h
++++ b/include/sway/config.h
+@@ -545,6 +545,7 @@ struct sway_config {
+ 	bool reloading;
+ 	bool reading;
+ 	bool validating;
++	bool load_errors; // the main config or an included file had errors
+ 	bool auto_back_and_forth;
+ 	bool show_marks;
+ 	enum alignment title_align;
+--- a/sway/config.c
++++ b/sway/config.c
+@@ -438,6 +438,7 @@ static bool load_config(const char *path
+ 
+ 	if (!config_load_success) {
+ 		sway_log(SWAY_ERROR, "Error(s) loading config!");
++		config->load_errors = true;
+ 	}
+ 
+ 	return config->active || !config->validating || config_load_success;
+@@ -509,6 +510,10 @@ bool load_main_config(const char *file,
+ 	set_from_resource_end_config_load();
+ 
+ 	if (validating) {
++		// sway -C fails on errors in included files as well
++		if (!is_active && config->load_errors) {
++			success = false;
++		}
+ 		free_config(config);
+ 		config = old_config;
+ 		return success;
