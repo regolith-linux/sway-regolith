@@ -23,3 +23,7 @@ Restrictions: allow-stderr
 Tests: trawl-restart
 Depends: sway-regolith, trawld, trawldb, dbus, jq
 Restrictions: allow-stderr
+
+Tests: variable-command-name
+Depends: sway-regolith, dbus
+Restrictions: allow-stderr

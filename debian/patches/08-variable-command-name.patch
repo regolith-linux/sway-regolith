@@ -1,0 +1,37 @@
+Description: Expand a variable used as command name
+ With `set $ex exec`, a config line `$ex foo` is accepted but foo never
+ runs, while i3 runs it. config_command() replaces a variable in the
+ command name, but exec returns CMD_DEFER while the config is loading,
+ and read_config() queues the line as written. run_deferred_commands()
+ passes it to execute_command(), which only replaces variables in the
+ arguments, so it fails with "Unknown/invalid command '$ex'".
+ .
+ Replace a variable in the command name in execute_command() as well,
+ as config_command() does.
+Author: rego-port-bot <339843353+rego-port-bot@users.noreply.github.com>
+Bug: https://github.com/swaywm/sway/issues/7718
+Forwarded: https://github.com/swaywm/sway/pull/9326
+Last-Update: 2026-11-09
+---
+diff --git a/sway/commands.c b/sway/commands.c
+--- a/sway/commands.c
++++ b/sway/commands.c
+@@ -263,6 +263,18 @@ list_t *execute_command(char *_exec, str
+ 		//TODO better handling of argv
+ 		int argc;
+ 		char **argv = split_args(cmd, &argc);
++		// Make sure the command is not stored in a variable
++		if (*argv[0] == '$') {
++			argv[0] = do_var_replacement(argv[0]);
++			char *temp = join_args(argv, argc);
++			free_argv(argc, argv);
++			argv = split_args(temp, &argc);
++			free(temp);
++			if (!argc) {
++				free_argv(argc, argv);
++				continue;
++			}
++		}
+ 		if (strcmp(argv[0], "exec") != 0 &&
+ 				strcmp(argv[0], "exec_always") != 0 &&
+ 				strcmp(argv[0], "mode") != 0) {

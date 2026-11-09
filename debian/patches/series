@@ -8,3 +8,4 @@
 04-dbus-tray
 05-remove-config
 07-keyboard-accessibility.patch
+08-variable-command-name.patch
