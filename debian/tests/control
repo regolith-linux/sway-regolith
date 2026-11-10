@@ -31,3 +31,7 @@ Restrictions: allow-stderr
 Tests: workspace-name-hex-escape
 Depends: sway-regolith, trawld, trawldb, dbus, jq, wtype
 Restrictions: allow-stderr
+
+Tests: a11y-keyboard-monitor
+Depends: sway-regolith, dbus, wtype, python3, python3-gi, gir1.2-glib-2.0
+Restrictions: allow-stderr
