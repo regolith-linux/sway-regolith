@@ -1,0 +1,139 @@
+#!/bin/sh
+# 14-output-mirroring: a nested sway with two outputs, the second one
+# mirroring the first. Each nested output is a window on a headless host
+# sway, so a screenshot of the host shows what each output displays.
+set -eu
+. debian/tests/lib-headless.sh
+in_dbus_session "$@"
+setup_runtime
+
+cat > "$WORK/host-config" <<EOF2
+xwayland disable
+default_border none
+default_floating_border none
+output HEADLESS-1 mode 1280x1024 position 0 0
+output HEADLESS-2 mode 1280x1024 position 1280 0
+for_window [title="^wlroots - WL-1\$"] floating enable, move absolute position 0 0
+for_window [title="^wlroots - WL-2\$"] floating enable, move absolute position 1280 0
+EOF2
+export WLR_HEADLESS_OUTPUTS=2
+start_sway "$WORK/host-config"
+HOST_SWAYSOCK=$SWAYSOCK
+for socket in "$XDG_RUNTIME_DIR"/wayland-*; do
+	case "$socket" in *.lock) continue ;; esac
+	HOST_DISPLAY=$socket
+done
+
+# WL-1 (red) is 1024x768; WL-2 (blue) is 800x480 and mirrors WL-1, so it
+# shows a 640x480 picture at x 80 with black bars on both sides.
+cat > "$WORK/nested-config" <<EOF2
+xwayland disable
+output WL-1 mode 1024x768 position 0 0 bg #ff0000 solid_color
+output WL-2 mode 800x480 position 1024 0 bg #0000ff solid_color mirror WL-1
+EOF2
+mkdir -m 700 "$WORK/nested"
+XDG_RUNTIME_DIR="$WORK/nested" WAYLAND_DISPLAY="$HOST_DISPLAY" \
+	WLR_BACKENDS=wayland WLR_WL_OUTPUTS=2 \
+	sway -c "$WORK/nested-config" > "$WORK/nested.log" 2>&1 &
+NESTED_PID=$!
+host_cleanup() {
+	kill "$NESTED_PID" 2>/dev/null || true
+	wait "$NESTED_PID" 2>/dev/null || true
+	cleanup
+}
+trap host_cleanup EXIT
+
+i=0
+until NESTED_SWAYSOCK=$(ls "$WORK"/nested/sway-ipc.*.sock 2>/dev/null) &&
+		swaymsg -s "$NESTED_SWAYSOCK" -t get_version > /dev/null 2>&1; do
+	i=$((i + 1))
+	if [ "$i" -gt 50 ] || ! kill -0 "$NESTED_PID" 2>/dev/null; then
+		cat "$WORK/nested.log"
+		fail "nested sway did not start"
+	fi
+	sleep 0.2
+done
+for socket in "$WORK"/nested/wayland-*; do
+	case "$socket" in *.lock) continue ;; esac
+	NESTED_DISPLAY=$socket
+done
+
+nested() { swaymsg -s "$NESTED_SWAYSOCK" "$@"; }
+
+# wait_for DESCRIPTION COMMAND...: retry COMMAND for up to 10 s.
+wait_for() {
+	description=$1
+	shift
+	i=0
+	until "$@" > /dev/null 2>&1; do
+		i=$((i + 1))
+		[ "$i" -le 50 ] || fail "$description"
+		sleep 0.2
+	done
+}
+
+# pixel OUTPUT X Y: "r g b" of a pixel of a host output.
+pixel() {
+	WAYLAND_DISPLAY="$HOST_DISPLAY" grim -t ppm -o "$1" "$WORK/shot.ppm"
+	python3 - "$WORK/shot.ppm" "$2" "$3" <<'EOF2'
+import re
+import sys
+data = open(sys.argv[1], "rb").read()
+header = re.match(rb"P6\s+(\d+)\s+(\d+)\s+255\s", data)
+width = int(header.group(1))
+offset = header.end() + 3 * (int(sys.argv[3]) * width + int(sys.argv[2]))
+print(*data[offset:offset + 3])
+EOF2
+}
+
+# pixel_is OUTPUT X Y R G B: the pixel is within 24 of R G B.
+pixel_is() {
+	rgb=$(pixel "$1" "$2" "$3") || return 1
+	set -- "$@" $rgb
+	[ $# -eq 9 ] || return 1
+	for c in 1 2 3; do
+		eval "want=\${$((3 + c))} got=\${$((6 + c))}"
+		[ "$got" -ge $((want - 24)) ] && [ "$got" -le $((want + 24)) ] || return 1
+	done
+}
+
+mirroring() {
+	nested -t get_outputs -r | jq -e '
+		(map({(.name): .}) | add) as $o |
+		$o["WL-2"].mirror == "WL-1" and $o["WL-2"].active and
+		$o["WL-2"].current_workspace == null and $o["WL-2"].rect == $o["WL-1"].rect and
+		$o["WL-1"].mirror == null'
+}
+
+wl_outputs() {
+	WAYLAND_DISPLAY="$NESTED_DISPLAY" wayland-info -i wl_output | grep -c "name: WL-" || true
+}
+
+wait_for "WL-2 does not mirror WL-1 in get_outputs" mirroring
+if nested -t get_workspaces -r | jq -e 'any(.[]; .output == "WL-2")' > /dev/null; then
+	fail "a workspace is on the mirror"
+fi
+[ "$(wl_outputs)" = 1 ] || fail "expected one wl_output while mirroring, got $(wl_outputs)"
+# Host HEADLESS-2 holds the window of WL-2 at its top-left corner
+wait_for "the mirror does not show the source" pixel_is HEADLESS-2 400 240 255 0 0
+pixel_is HEADLESS-2 40 240 0 0 0 || fail "no black bar left of the picture"
+pixel_is HEADLESS-2 760 240 0 0 0 || fail "no black bar right of the picture"
+echo "mirroring: WL-2 shows WL-1 fitted, with no workspace and no wl_output"
+
+if nested output WL-1 mirror WL-2 > /dev/null 2>&1; then
+	fail "a chain was accepted"
+fi
+if nested output WL-2 mirror WL-2 > /dev/null 2>&1; then
+	fail "an output was allowed to mirror itself"
+fi
+mirroring > /dev/null || fail "a rejected command changed the outputs"
+echo "rejections: chain and self-mirror refused"
+
+nested output WL-2 mirror off > /dev/null
+wait_for "WL-2 did not become a normal output" sh -c \
+	"swaymsg -s '$NESTED_SWAYSOCK' -t get_outputs -r | jq -e '.[] | select(.name == \"WL-2\") | .mirror == null and .current_workspace != null and .rect.x == 1024'"
+wait_for "WL-2 does not show its own background" pixel_is HEADLESS-2 400 240 0 0 255
+[ "$(wl_outputs)" = 2 ] || fail "expected two wl_outputs after mirror off, got $(wl_outputs)"
+echo "mirror off: WL-2 is a normal output again"
+
+echo "PASS: output-mirroring"
