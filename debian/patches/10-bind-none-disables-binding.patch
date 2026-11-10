@@ -1,0 +1,74 @@
+Description: Let the key none switch a binding off
+ Regolith's shipped bindings take their keys from trawl resources, as in
+ "bindsym $mod+$wm.binding.terminal exec ...", so the natural way to drop
+ one is to set its resource to none. sway rejected that with "Unknown key
+ or button 'none'", and swaynag reported it on every start and reload.
+ .
+ A bindsym, bindcode, unbindsym or unbindcode key combination that
+ contains the key none, in any letter case, is now accepted and does
+ nothing: no binding is added or removed and nothing is logged above
+ debug level. Every other key in the combination is still checked, so a
+ typo such as Mod4+Retrun+none is still reported as an unknown key.
+ Because nothing is bound, any number of such lines may share the same
+ modifiers without "Overwriting binding" warnings. sway(5) documents the
+ behaviour.
+Author: rego-port-bot <339843353+rego-port-bot@users.noreply.github.com>
+Bug-Regolith: https://github.com/regolith-linux/regolith-desktop/issues/743
+Forwarded: no
+Last-Update: 2026-11-09
+---
+--- a/sway/commands/bind.c
++++ b/sway/commands/bind.c
+@@ -395,6 +395,7 @@ static struct cmd_results *cmd_bindsym_o
+ 			bindtype, minargs, argc);
+ 	}
+ 
++	bool disabled = false;
+ 	list_t *split = split_string(argv[0], "+");
+ 	for (int i = 0; i < split->length; ++i) {
+ 		// Check for group
+@@ -432,6 +433,14 @@ static struct cmd_results *cmd_bindsym_o
+ 			continue;
+ 		}
+ 
++		// The key "none" turns the whole combination into a no-op, so that
++		// a binding whose key comes from a variable can be switched off.
++		// The remaining keys are still checked, to report typos.
++		if (strcasecmp(split->items[i], "none") == 0) {
++			disabled = true;
++			continue;
++		}
++
+ 		// Identify the key and possibly change binding->type
+ 		uint32_t key_val = 0;
+ 		error = identify_key(split->items[i], binding->keys->length == 0,
+@@ -454,6 +463,13 @@ static struct cmd_results *cmd_bindsym_o
+ 	}
+ 	list_free_items_and_destroy(split);
+ 
++	if (disabled) {
++		sway_log(SWAY_DEBUG, "%s - %s contains the key none, nothing to do",
++				bindtype, argv[0]);
++		free_sway_binding(binding);
++		return cmd_results_new(CMD_SUCCESS, NULL);
++	}
++
+ 	// refine region of interest for mouse binding once we are certain
+ 	// that this is one
+ 	if (exclude_titlebar) {
+--- a/sway/sway.5.scd
++++ b/sway/sway.5.scd
+@@ -440,6 +440,13 @@ runtime.
+ 	AltGr). In addition, you can use the aliases  _Ctrl_ (for Control), _Alt_
+ 	(for Alt), and _Super_ (for the Logo key).
+ 
++	If _key combo_ contains the key _none_ (in any letter case), nothing is
++	bound and no warning is given, provided the other keys in _key combo_ are
++	valid. A binding whose key is taken from a variable can therefore be
++	switched off by setting the variable to _none_. *bindcode*, *unbindsym*
++	and *unbindcode* handle _none_ in the same way; the latter two remove
++	nothing.
++
+ 	Unless the flag _--locked_ is set, the command will not be run when a
+ 	screen locking program is active. If there is a matching binding with
+ 	and without _--locked_, the one with will be preferred when locked and the

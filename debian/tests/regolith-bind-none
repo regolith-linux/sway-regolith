@@ -1,0 +1,77 @@
+#!/bin/sh
+# 10-bind-none-disables-binding with Regolith's config: setting binding
+# resources to none switches those shipped bindings off quietly, at start
+# and on reload, and the other bindings stay.
+set -eu
+. debian/tests/lib-headless.sh
+in_dbus_session "$@"
+setup_runtime
+start_trawld
+
+load_resources /usr/share/regolith-look/default/root wm.client.focused.color.child_border
+cat > "$WORK/none" <<'EOF'
+wm.binding.terminal: none
+wm.binding.reboot: none
+wm.binding.logout: none
+EOF
+trawldb --merge "$WORK/none"
+trawldb --query 2>&1 | grep -q '^wm.binding.terminal[[:space:]]*:[[:space:]]*none' ||
+	fail "wm.binding.terminal is not none in trawl"
+
+# check_quiet: nothing in the log about the switched-off lines.
+check_quiet() {
+	if grep -E 'Unknown key|Overwriting binding|\+none' "$WORK/sway.log"; then
+		fail "sway logged the switched-off bindings"
+	fi
+}
+
+# bound COMBO: COMBO is bound in the default mode. Probing with unbindsym
+# removes the binding, so put it back afterwards.
+bound() {
+	swaymsg "unbindsym $1" > /dev/null 2>&1 || return 1
+	swaymsg "bindsym $1 nop probe" > /dev/null
+}
+
+sway -C -c /etc/regolith/sway/config > "$WORK/validate.log" 2>&1 || {
+	cat "$WORK/validate.log"
+	fail "sway -C rejected the config"
+}
+if grep -E 'Unknown key|\+none' "$WORK/validate.log"; then
+	fail "sway -C reported the switched-off bindings"
+fi
+
+start_sway /etc/regolith/sway/config
+check_quiet
+! bound Mod4+Return || fail "Mod4+Return (terminal) is still bound"
+! bound Mod4+Shift+b || fail "Mod4+Shift+b (reboot) is still bound"
+! bound Mod4+Shift+e || fail "Mod4+Shift+e (logout) is still bound"
+bound Mod4+Tab || fail "Mod4+Tab (next workspace) is no longer bound"
+
+# At run time, through IPC.
+swaymsg 'bindsym Mod4+Shift+none exec false' > /dev/null ||
+	fail "IPC: bindsym Mod4+Shift+none was rejected"
+if swaymsg 'bindsym Mod4+Retrun+none exec false' > "$WORK/ipc.log" 2>&1; then
+	fail "IPC: bindsym Mod4+Retrun+none was accepted"
+fi
+grep -q "Unknown key or button 'Retrun'" "$WORK/ipc.log" ||
+	fail "IPC: no error for Mod4+Retrun+none"
+
+# Removing the resources brings the shipped bindings back on reload
+# (trawldb --remove clears every resource, so load the look again).
+trawldb --remove
+load_resources /usr/share/regolith-look/default/root wm.client.focused.color.child_border
+swaymsg reload > /dev/null
+sleep 1
+check_quiet
+bound Mod4+Return || fail "Mod4+Return (terminal) is not back after reload"
+bound Mod4+Shift+b || fail "Mod4+Shift+b (reboot) is not back after reload"
+
+# And setting one again switches it off on reload.
+printf 'wm.binding.terminal: none\n' > "$WORK/none"
+trawldb --merge "$WORK/none"
+swaymsg reload > /dev/null
+sleep 1
+check_quiet
+! bound Mod4+Return || fail "Mod4+Return (terminal) is bound after reload"
+
+echo "PASS: regolith-bind-none"
