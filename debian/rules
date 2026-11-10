@@ -12,9 +12,11 @@ export DEB_CFLAGS_MAINT_APPEND = -Wno-error=deprecated-declarations
 %:
 	dh $@
 
+# 13-a11y-keyboard-monitor: fail the build rather than ship sway without the
+# keyboard monitor that Orca needs.
 .PHONY: override_dh_auto_configure
 override_dh_auto_configure:
-	dh_auto_configure -- --libexecdir=lib -Ddefault-wallpaper=false
+	dh_auto_configure -- --libexecdir=lib -Ddefault-wallpaper=false -Da11y=enabled
 
 .PHONY: override_dh_missing
 override_dh_missing:
