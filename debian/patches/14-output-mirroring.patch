@@ -1,0 +1,853 @@
+Description: Add output mirroring
+ Regolith's X11 session can mirror two monitors, for example a laptop
+ panel and a projector, but sway has no mirroring: `output <name> mirror`
+ is rejected, and placing two outputs at the same position keeps them
+ two separate monitors, with their own workspaces, bars and backgrounds.
+ .
+ Add `output <name> mirror <source>|off`. A mirror shows the area of the
+ layout that its source covers, cursor included, scaled by the same
+ factor on both axes to fit its own mode and transform, centred, with
+ black bars around it. Output scales don't change the picture. While it
+ mirrors, the output takes no space in the layout, has no workspaces
+ (they move to other outputs as when it is disabled) and no wl_output,
+ so clients, bars and backgrounds only see the source. Its mode,
+ transform and color profile still apply.
+ .
+ Mirroring takes effect while both outputs are connected and enabled;
+ otherwise the output works as a normal one and switches as the source
+ connects, disconnects, is enabled or disabled. While the source is
+ powered off, the mirror is black. Self-mirroring and chains are
+ rejected. get_outputs gains a "mirror" key and lists a mirror as active
+ with the rect of its source; output management clients see a mirror
+ at the position of its source.
+Author: rego-port-bot <339843353+rego-port-bot@users.noreply.github.com>
+Bug: https://github.com/swaywm/sway/issues/8644
+Forwarded: https://github.com/swaywm/sway/pull/9332
+Last-Update: 2026-11-09
+---
+--- a/include/sway/commands.h
++++ b/include/sway/commands.h
+@@ -302,6 +302,7 @@ sway_cmd output_cmd_disable;
+ sway_cmd output_cmd_dpms;
+ sway_cmd output_cmd_enable;
+ sway_cmd output_cmd_max_render_time;
++sway_cmd output_cmd_mirror;
+ sway_cmd output_cmd_mode;
+ sway_cmd output_cmd_modeline;
+ sway_cmd output_cmd_position;
+--- a/include/sway/config.h
++++ b/include/sway/config.h
+@@ -304,6 +304,10 @@ struct output_config {
+ 	char *background;
+ 	char *background_option;
+ 	char *background_fallback;
++
++	// Name of the output this output mirrors. NULL when not configured, an
++	// empty string when mirroring was explicitly turned off.
++	char *mirror;
+ };
+ 
+ /**
+--- a/include/sway/output.h
++++ b/include/sway/output.h
+@@ -12,6 +12,9 @@
+ 
+ struct sway_server;
+ struct sway_container;
++struct wlr_color_transform;
++struct wlr_drm_syncobj_timeline;
++struct wlr_swapchain;
+ 
+ struct sway_output_state {
+ 	list_t *workspaces;
+@@ -72,6 +75,23 @@ struct sway_output {
+ 	int max_render_time; // In milliseconds
+ 	struct wl_event_source *repaint_timer;
+ 	bool allow_tearing;
++
++	// Set while this output mirrors another one. A mirror is enabled at the
++	// wlr_output level but disabled for the tree: it isn't part of the
++	// layout, and has no workspaces, wl_output global or scene output.
++	struct sway_output *mirror_source;
++	struct {
++		struct wl_listener source_commit;
++		// Latest frame committed by the source, the timeline point to wait
++		// on before reading it, and the source's transform and logical size
++		// for that frame
++		struct wlr_buffer *buffer;
++		struct wlr_drm_syncobj_timeline *wait_timeline;
++		uint64_t wait_point;
++		enum wl_output_transform transform;
++		int width, height;
++		bool needs_frame;
++	} mirror;
+ };
+ 
+ struct sway_output_non_desktop {
+@@ -116,6 +136,20 @@ void output_enable(struct sway_output *o
+ 
+ void output_disable(struct sway_output *output);
+ 
++void output_start_mirroring(struct sway_output *output,
++		struct sway_output *source);
++
++void output_stop_mirroring(struct sway_output *output);
++
++/**
++ * Renders the frame of a mirror of source into state, with the given swapchain
++ * (or the output's own one if NULL) and color transform.
++ */
++bool output_mirror_build_state(struct sway_output *output,
++		struct sway_output *source, struct wlr_output_state *state,
++		struct wlr_swapchain *swapchain,
++		struct wlr_color_transform *color_transform);
++
+ struct sway_workspace *output_get_active_workspace(struct sway_output *output);
+ 
+ void output_for_each_workspace(struct sway_output *output,
+--- a/sway/commands/output.c
++++ b/sway/commands/output.c
+@@ -16,6 +16,7 @@ static const struct cmd_handler output_h
+ 	{ "dpms", output_cmd_dpms },
+ 	{ "enable", output_cmd_enable },
+ 	{ "max_render_time", output_cmd_max_render_time },
++	{ "mirror", output_cmd_mirror },
+ 	{ "mode", output_cmd_mode },
+ 	{ "modeline", output_cmd_modeline },
+ 	{ "pos", output_cmd_position },
+--- /dev/null
++++ b/sway/commands/output/mirror.c
+@@ -0,0 +1,85 @@
++#include <string.h>
++#include <strings.h>
++#include "sway/commands.h"
++#include "sway/config.h"
++#include "log.h"
++
++// Returns the source that the output config named `name` mirrors, or NULL if
++// it isn't configured to mirror anything.
++static const char *configured_source_of(const char *name) {
++	for (int i = 0; i < config->output_configs->length; i++) {
++		struct output_config *oc = config->output_configs->items[i];
++		if (oc->mirror && oc->mirror[0] != '\0' &&
++				strcmp(oc->name, name) == 0) {
++			return oc->mirror;
++		}
++	}
++	return NULL;
++}
++
++// Returns the name of an output (other than `source` itself) configured to
++// mirror `source`, or NULL if there is none.
++static const char *configured_mirror_of(const char *source) {
++	for (int i = 0; i < config->output_configs->length; i++) {
++		struct output_config *oc = config->output_configs->items[i];
++		if (oc->mirror && oc->mirror[0] != '\0' &&
++				strcmp(oc->name, source) != 0 &&
++				strcmp(oc->mirror, source) == 0) {
++			return oc->name;
++		}
++	}
++	return NULL;
++}
++
++struct cmd_results *output_cmd_mirror(int argc, char **argv) {
++	struct output_config *oc = config->handler_context.output_config;
++	if (!oc) {
++		return cmd_results_new(CMD_FAILURE, "Missing output config");
++	}
++	if (!argc) {
++		return cmd_results_new(CMD_INVALID, "Missing mirror argument.");
++	}
++	if (strcmp(oc->name, "*") == 0) {
++		return cmd_results_new(CMD_INVALID,
++				"Cannot configure mirroring for all outputs.");
++	}
++
++	const char *source = argv[0];
++	if (strcasecmp(source, "off") == 0) {
++		// Turning mirroring off is always allowed, even if the output isn't
++		// mirroring or is itself the source of another output's mirror.
++		source = "";
++	} else {
++		if (source[0] == '\0' || strcmp(source, "*") == 0) {
++			return cmd_results_new(CMD_INVALID,
++					"Invalid mirror source '%s'.", source);
++		}
++		if (strcmp(source, oc->name) == 0) {
++			return cmd_results_new(CMD_FAILURE,
++					"Output %s cannot mirror itself.", oc->name);
++		}
++		const char *chained = configured_source_of(source);
++		if (chained) {
++			return cmd_results_new(CMD_FAILURE,
++					"Output %s mirrors %s and cannot be a mirror source.",
++					source, chained);
++		}
++		const char *mirror = configured_mirror_of(oc->name);
++		if (mirror) {
++			return cmd_results_new(CMD_FAILURE,
++					"Output %s is the mirror source of %s and cannot "
++					"mirror another output.", oc->name, mirror);
++		}
++	}
++
++	free(oc->mirror);
++	oc->mirror = strdup(source);
++	if (!oc->mirror) {
++		sway_log(SWAY_ERROR, "Failed to allocate mirror source");
++		return cmd_results_new(CMD_FAILURE, "Unable to allocate resource");
++	}
++
++	config->handler_context.leftovers.argc = argc - 1;
++	config->handler_context.leftovers.argv = argv + 1;
++	return NULL;
++}
+--- a/sway/config/output.c
++++ b/sway/config/output.c
+@@ -154,6 +154,10 @@ static void supersede_output_config(stru
+ 	if (src->allow_tearing != -1) {
+ 		dst->allow_tearing = -1;
+ 	}
++	if (src->mirror) {
++		free(dst->mirror);
++		dst->mirror = NULL;
++	}
+ }
+ 
+ // merge_output_config sets all fields in dst that were set in src
+@@ -229,6 +233,10 @@ static void merge_output_config(struct o
+ 	if (src->allow_tearing != -1) {
+ 		dst->allow_tearing = src->allow_tearing;
+ 	}
++	if (src->mirror) {
++		free(dst->mirror);
++		dst->mirror = strdup(src->mirror);
++	}
+ }
+ 
+ void store_output_config(struct output_config *oc) {
+@@ -502,12 +510,38 @@ static void queue_output_config(struct o
+ 	}
+ }
+ 
+-static bool finalize_output_config(struct output_config *oc, struct sway_output *output) {
++static bool finalize_output_config(struct output_config *oc,
++		struct sway_output *output, struct sway_output *mirror_source) {
+ 	if (output == root->fallback_output) {
+ 		return false;
+ 	}
+ 
+ 	struct wlr_output *wlr_output = output->wlr_output;
++	if (oc && oc->set_color_transform) {
++		if (oc->color_transform) {
++			wlr_color_transform_ref(oc->color_transform);
++		}
++		wlr_color_transform_unref(output->color_transform);
++		output->color_transform = oc->color_transform;
++	} else {
++		wlr_color_transform_unref(output->color_transform);
++		output->color_transform = NULL;
++	}
++
++	if (mirror_source) {
++		// A mirror takes no space in the layout and has no workspaces: for
++		// the tree, it is a disabled output
++		sway_log(SWAY_DEBUG, "Output %s mirrors %s", wlr_output->name,
++			mirror_source->wlr_output->name);
++		if (output->enabled) {
++			output_disable(output);
++			wlr_output_layout_remove(root->output_layout, wlr_output);
++		}
++		output_start_mirroring(output, mirror_source);
++		return true;
++	}
++	output_stop_mirroring(output);
++
+ 	if (oc && !oc->enabled) {
+ 		sway_log(SWAY_DEBUG, "Disabling output %s", oc->name);
+ 		if (output->enabled) {
+@@ -548,17 +582,6 @@ static bool finalize_output_config(struc
+ 		output_enable(output);
+ 	}
+ 
+-	if (oc && oc->set_color_transform) {
+-		if (oc->color_transform) {
+-			wlr_color_transform_ref(oc->color_transform);
+-		}
+-		wlr_color_transform_unref(output->color_transform);
+-		output->color_transform = oc->color_transform;
+-	} else {
+-		wlr_color_transform_unref(output->color_transform);
+-		output->color_transform = NULL;
+-	}
+-
+ 	output->max_render_time = oc && oc->max_render_time > 0 ? oc->max_render_time : 0;
+ 	output->allow_tearing = oc && oc->allow_tearing > 0;
+ 
+@@ -629,6 +652,8 @@ static bool config_has_manual_mode(struc
+ struct matched_output_config {
+ 	struct sway_output *output;
+ 	struct output_config *config;
++	// The output this output mirrors with this configuration, if any
++	struct sway_output *mirror_source;
+ };
+ 
+ struct search_context {
+@@ -870,6 +895,39 @@ static void sort_output_configs_by_prior
+ 	qsort(configs, configs_len, sizeof(*configs), compare_matched_output_config_priority);
+ }
+ 
++static bool config_mirrors(struct output_config *oc) {
++	return oc && oc->mirror && oc->mirror[0] != '\0';
++}
++
++static bool config_is_disabled(struct output_config *oc) {
++	return oc && oc->enabled == 0;
++}
++
++// Returns the output that the output of configs[idx] mirrors under this
++// configuration, or NULL if it works as a normal output. Mirroring needs both
++// outputs connected and enabled; powering one of them off doesn't end it.
++// There are no chains.
++static struct sway_output *resolve_mirror_source(
++		struct matched_output_config *configs, size_t configs_len, size_t idx) {
++	struct output_config *oc = configs[idx].config;
++	if (!config_mirrors(oc) || config_is_disabled(oc)) {
++		return NULL;
++	}
++	for (size_t i = 0; i < configs_len; i++) {
++		struct matched_output_config *other = &configs[i];
++		if (i == idx || strcmp(other->output->wlr_output->name,
++				oc->mirror) != 0) {
++			continue;
++		}
++		if (config_is_disabled(other->config) ||
++				config_mirrors(other->config)) {
++			return NULL;
++		}
++		return other->output;
++	}
++	return NULL;
++}
++
+ static bool apply_resolved_output_configs(struct matched_output_config *configs,
+ 		size_t configs_len, bool test_only, bool degrade_to_off) {
+ 	struct wlr_backend_output_state *states = calloc(configs_len, sizeof(*states));
+@@ -889,6 +947,11 @@ static bool apply_resolved_output_config
+ 		dump_output_state(cfg->output->wlr_output, &backend_state->base);
+ 	}
+ 
++	for (size_t idx = 0; idx < configs_len; idx++) {
++		configs[idx].mirror_source =
++			resolve_mirror_source(configs, configs_len, idx);
++	}
++
+ 	struct wlr_output_swapchain_manager swapchain_mgr;
+ 	wlr_output_swapchain_manager_init(&swapchain_mgr, server.backend);
+ 
+@@ -922,8 +985,26 @@ static bool apply_resolved_output_config
+ 				&swapchain_mgr, backend_state->output),
+ 			.color_transform = cfg->output->color_transform,
+ 		};
+-		struct wlr_scene_output *scene_output = cfg->output->scene_output;
+ 		struct wlr_output_state *state = &backend_state->base;
++		if (cfg->mirror_source) {
++			if (!output_mirror_build_state(cfg->output, cfg->mirror_source,
++					state, opts.swapchain, opts.color_transform)) {
++				sway_log(SWAY_ERROR, "Building mirror state for '%s' failed",
++					backend_state->output->name);
++				goto out;
++			}
++			continue;
++		}
++		if (!cfg->output->scene_output) {
++			// The output stops mirroring and needs its scene output back
++			cfg->output->scene_output = wlr_scene_output_create(
++				root->root_scene, cfg->output->wlr_output);
++			if (!cfg->output->scene_output) {
++				sway_log(SWAY_ERROR, "Failed to create a scene output");
++				goto out;
++			}
++		}
++		struct wlr_scene_output *scene_output = cfg->output->scene_output;
+ 		if (!wlr_scene_output_build_state(scene_output, state, &opts)) {
+ 			sway_log(SWAY_ERROR, "Building output state for '%s' failed",
+ 				backend_state->output->name);
+@@ -945,7 +1026,7 @@ static bool apply_resolved_output_config
+ 		struct matched_output_config *cfg = &configs[idx];
+ 		sway_log(SWAY_DEBUG, "Finalizing config for %s",
+ 			cfg->output->wlr_output->name);
+-		finalize_output_config(cfg->config, cfg->output);
++		finalize_output_config(cfg->config, cfg->output, cfg->mirror_source);
+ 	}
+ 
+ 	// Output layout being applied in finalize_output_config can shift outputs
+@@ -956,12 +1037,32 @@ static bool apply_resolved_output_config
+ 		arrange_layers(cfg->output);
+ 	}
+ 
++	// A mirror shows, and reports, the area of the layout its source covers
++	for (size_t idx = 0; idx < configs_len; idx++) {
++		struct sway_output *output = configs[idx].output;
++		if (output->mirror_source) {
++			output->lx = output->mirror_source->lx;
++			output->ly = output->mirror_source->ly;
++			output->width = output->mirror_source->width;
++			output->height = output->mirror_source->height;
++		}
++	}
++
+ 	arrange_root();
+ 	arrange_locks();
+ 	update_output_manager_config(&server);
+ 	transaction_commit_dirty();
+ 
+ out:
++	// Outputs that keep mirroring (for instance after a failed commit) must not
++	// keep a scene output created for them above.
++	for (size_t idx = 0; idx < configs_len; idx++) {
++		struct sway_output *output = configs[idx].output;
++		if (output->mirror_source && output->scene_output) {
++			wlr_scene_output_destroy(output->scene_output);
++			output->scene_output = NULL;
++		}
++	}
+ 	wlr_output_swapchain_manager_finish(&swapchain_mgr);
+ 	for (size_t idx = 0; idx < configs_len; idx++) {
+ 		struct wlr_backend_output_state *backend_state = &states[idx];
+@@ -1029,6 +1130,7 @@ void free_output_config(struct output_co
+ 	free(oc->background);
+ 	free(oc->background_option);
+ 	free(oc->background_fallback);
++	free(oc->mirror);
+ 	wlr_color_transform_unref(oc->color_transform);
+ 	free(oc);
+ }
+--- a/sway/desktop/output.c
++++ b/sway/desktop/output.c
+@@ -1,10 +1,13 @@
+ #include <assert.h>
++#include <math.h>
+ #include <stdlib.h>
+ #include <strings.h>
+ #include <time.h>
+ #include <wayland-server-core.h>
+ #include <wlr/config.h>
+ #include <wlr/backend/headless.h>
++#include <wlr/interfaces/wlr_output.h>
++#include <wlr/render/drm_syncobj.h>
+ #include <wlr/render/swapchain.h>
+ #include <wlr/render/wlr_renderer.h>
+ #include <wlr/types/wlr_buffer.h>
+@@ -16,6 +19,7 @@
+ #include <wlr/types/wlr_output.h>
+ #include <wlr/types/wlr_presentation_time.h>
+ #include <wlr/types/wlr_compositor.h>
++#include <wlr/util/box.h>
+ #include <wlr/util/region.h>
+ #include <wlr/util/transform.h>
+ #include "config.h"
+@@ -264,7 +268,8 @@ static int output_repaint_timer_handler(
+ 	struct sway_output *output = data;
+ 
+ 	output->wlr_output->frame_pending = false;
+-	if (!output->wlr_output->enabled) {
++	if (!output->wlr_output->enabled || !output->scene_output) {
++		// The output may have started mirroring since the timer was armed
+ 		return 0;
+ 	}
+ 
+@@ -303,9 +308,221 @@ static int output_repaint_timer_handler(
+ 	return 0;
+ }
+ 
++bool output_mirror_build_state(struct sway_output *output,
++		struct sway_output *source, struct wlr_output_state *state,
++		struct wlr_swapchain *swapchain,
++		struct wlr_color_transform *color_transform) {
++	struct wlr_output *wlr_output = output->wlr_output;
++	bool enabled = wlr_output->enabled;
++	if (state->committed & WLR_OUTPUT_STATE_ENABLED) {
++		enabled = state->enabled;
++	}
++	if (!enabled) {
++		return true;
++	}
++
++	if (!swapchain) {
++		if (!wlr_output_configure_primary_swapchain(wlr_output, state,
++				&wlr_output->swapchain)) {
++			return false;
++		}
++		swapchain = wlr_output->swapchain;
++	}
++
++	struct wlr_buffer *buffer = wlr_swapchain_acquire(swapchain);
++	if (!buffer) {
++		return false;
++	}
++
++	struct wlr_render_pass *pass = wlr_renderer_begin_buffer_pass(
++		wlr_output->renderer, buffer, &(struct wlr_buffer_pass_options){
++			.color_transform = color_transform,
++		});
++	if (!pass) {
++		wlr_buffer_unlock(buffer);
++		return false;
++	}
++
++	// Black wherever the picture doesn't reach
++	wlr_render_pass_add_rect(pass, &(struct wlr_render_rect_options){
++		.box = { .width = buffer->width, .height = buffer->height },
++		.color = { .r = 0, .g = 0, .b = 0, .a = 1 },
++		.blend_mode = WLR_RENDER_BLEND_MODE_NONE,
++	});
++
++	// The stored frame is only valid for the source it came from
++	struct wlr_texture *texture = NULL;
++	if (output->mirror_source == source && output->mirror.buffer != NULL) {
++		texture = wlr_texture_from_buffer(wlr_output->renderer,
++			output->mirror.buffer);
++	}
++
++	if (texture != NULL && output->mirror.width > 0 &&
++			output->mirror.height > 0) {
++		enum wl_output_transform transform = wlr_output->transform;
++		if (state->committed & WLR_OUTPUT_STATE_TRANSFORM) {
++			transform = state->transform;
++		}
++
++		// Fit the source's logical size into the mirror's transformed size
++		// with the same factor on both axes, and centre it. Output scales
++		// don't change the picture, only the aspect ratios matter.
++		int width = buffer->width, height = buffer->height;
++		if (transform & WL_OUTPUT_TRANSFORM_90) {
++			width = buffer->height;
++			height = buffer->width;
++		}
++		double fit = fmin((double)width / output->mirror.width,
++			(double)height / output->mirror.height);
++		struct wlr_box box = {
++			.width = fmin(round(output->mirror.width * fit), width),
++			.height = fmin(round(output->mirror.height * fit), height),
++		};
++		box.x = (width - box.width) / 2;
++		box.y = (height - box.height) / 2;
++
++		struct wlr_box dst_box;
++		wlr_box_transform(&dst_box, &box,
++			wlr_output_transform_invert(transform), width, height);
++
++		// The source's buffer holds its content with the source's transform
++		// applied: undo it, then apply the mirror's
++		struct wlr_render_texture_options options = {
++			.texture = texture,
++			.dst_box = dst_box,
++			.transform = wlr_output_transform_compose(
++				wlr_output_transform_invert(output->mirror.transform),
++				transform),
++			.filter_mode = WLR_SCALE_FILTER_BILINEAR,
++			.blend_mode = WLR_RENDER_BLEND_MODE_NONE,
++		};
++		if (wlr_output->renderer->features.timeline) {
++			options.wait_timeline = output->mirror.wait_timeline;
++			options.wait_point = output->mirror.wait_point;
++		}
++		wlr_render_pass_add_texture(pass, &options);
++	}
++
++	bool ok = wlr_render_pass_submit(pass);
++	wlr_texture_destroy(texture);
++	if (ok) {
++		wlr_output_state_set_buffer(state, buffer);
++	}
++	wlr_buffer_unlock(buffer);
++	return ok;
++}
++
++static void mirror_repaint(struct sway_output *output) {
++	output->mirror.needs_frame = false;
++
++	struct wlr_output_state pending;
++	wlr_output_state_init(&pending);
++	if (output_mirror_build_state(output, output->mirror_source, &pending,
++			NULL, output->color_transform)) {
++		if (!wlr_output_commit_state(output->wlr_output, &pending)) {
++			sway_log(SWAY_ERROR, "Page-flip failed on mirror output %s",
++				output->wlr_output->name);
++		}
++	}
++	wlr_output_state_finish(&pending);
++}
++
++static void mirror_clear_frame(struct sway_output *output) {
++	wlr_buffer_unlock(output->mirror.buffer);
++	output->mirror.buffer = NULL;
++	if (output->mirror.wait_timeline != NULL) {
++		wlr_drm_syncobj_timeline_unref(output->mirror.wait_timeline);
++		output->mirror.wait_timeline = NULL;
++	}
++}
++
++static void handle_mirror_source_commit(struct wl_listener *listener,
++		void *data) {
++	struct sway_output *output =
++		wl_container_of(listener, output, mirror.source_commit);
++	struct wlr_output_event_commit *event = data;
++	const struct wlr_output_state *state = event->state;
++	if ((state->committed & WLR_OUTPUT_STATE_ENABLED) && !state->enabled) {
++		// The source shows nothing while it is powered off, and neither
++		// does the mirror
++		mirror_clear_frame(output);
++		output->mirror.needs_frame = true;
++		wlr_output_schedule_frame(output->wlr_output);
++		return;
++	}
++	if (!(state->committed & WLR_OUTPUT_STATE_BUFFER) || !state->buffer) {
++		return;
++	}
++
++	// Keep the source's latest frame. The source's swapchain doesn't reuse
++	// the buffer while it is locked.
++	mirror_clear_frame(output);
++	output->mirror.buffer = wlr_buffer_lock(state->buffer);
++	if ((state->committed & WLR_OUTPUT_STATE_WAIT_TIMELINE) &&
++			state->wait_timeline != NULL) {
++		output->mirror.wait_timeline =
++			wlr_drm_syncobj_timeline_ref(state->wait_timeline);
++		output->mirror.wait_point = state->wait_point;
++	}
++	output->mirror.transform = event->output->transform;
++	wlr_output_effective_resolution(event->output, &output->mirror.width,
++		&output->mirror.height);
++
++	output->mirror.needs_frame = true;
++	wlr_output_schedule_frame(output->wlr_output);
++}
++
++void output_start_mirroring(struct sway_output *output,
++		struct sway_output *source) {
++	// A mirror shows its source's frames, not the scene
++	wlr_scene_output_destroy(output->scene_output);
++	output->scene_output = NULL;
++
++	if (output->mirror_source == source) {
++		return;
++	}
++	output_stop_mirroring(output);
++
++	output->mirror_source = source;
++	output->mirror.source_commit.notify = handle_mirror_source_commit;
++	wl_signal_add(&source->wlr_output->events.commit,
++		&output->mirror.source_commit);
++
++	// Every frame of the source has to be composited by the renderer, with
++	// the cursor in it: a buffer scanned out directly may be a client buffer
++	// that doesn't cover the whole output, and hardware cursors aren't part
++	// of the buffer.
++	wlr_output_lock_attach_render(source->wlr_output, true);
++	wlr_output_lock_software_cursors(source->wlr_output, true);
++
++	// Ask the source for a new frame, which the mirror then shows
++	wlr_output_update_needs_frame(source->wlr_output);
++	output->mirror.needs_frame = true;
++	wlr_output_schedule_frame(output->wlr_output);
++}
++
++void output_stop_mirroring(struct sway_output *output) {
++	struct sway_output *source = output->mirror_source;
++	if (!source) {
++		return;
++	}
++	wlr_output_lock_attach_render(source->wlr_output, false);
++	wlr_output_lock_software_cursors(source->wlr_output, false);
++	wl_list_remove(&output->mirror.source_commit.link);
++	mirror_clear_frame(output);
++	output->mirror_source = NULL;
++	output->mirror.needs_frame = false;
++}
++
+ static void handle_frame(struct wl_listener *listener, void *user_data) {
+ 	struct sway_output *output =
+ 		wl_container_of(listener, output, frame);
++	if (output->mirror_source) {
++		if (output->mirror.needs_frame && output->wlr_output->enabled) {
++			mirror_repaint(output);
++		}
++		return;
++	}
+ 	if (!output->enabled || !output->wlr_output->enabled) {
+ 		return;
+ 	}
+@@ -378,9 +595,13 @@ void update_output_manager_config(struct
+ 		}
+ 		struct wlr_output_configuration_head_v1 *config_head =
+ 			wlr_output_configuration_head_v1_create(config, output->wlr_output);
++		// A mirror is shown at the position of its source, which is the
++		// area of the layout it shows
++		struct wlr_output *layout_output = output->mirror_source ?
++			output->mirror_source->wlr_output : output->wlr_output;
+ 		struct wlr_box output_box;
+-		wlr_output_layout_get_box(root->output_layout,
+-			output->wlr_output, &output_box);
++		wlr_output_layout_get_box(root->output_layout, layout_output,
++			&output_box);
+ 		// We mark the output enabled when it's switched off but not disabled
+ 		config_head->state.enabled = !wlr_box_empty(&output_box);
+ 		config_head->state.x = output_box.x;
+@@ -422,6 +643,15 @@ void force_modeset(void) {
+ }
+ 
+ static void begin_destroy(struct sway_output *output) {
++	// Mirrors of this output stop mirroring; the modeset requested below
++	// turns them into normal outputs.
++	struct sway_output *other;
++	wl_list_for_each(other, &root->all_outputs, link) {
++		if (other->mirror_source == output) {
++			output_stop_mirroring(other);
++		}
++	}
++	output_stop_mirroring(output);
+ 
+ 	wl_list_remove(&output->layout_destroy.link);
+ 	wl_list_remove(&output->destroy.link);
+--- a/sway/ipc-json.c
++++ b/sway/ipc-json.c
+@@ -324,6 +324,8 @@ static void ipc_json_describe_wlr_output
+ static void ipc_json_describe_output(struct sway_output *output,
+ 		json_object *object) {
+ 	ipc_json_describe_wlr_output(output->wlr_output, object);
++	json_object_object_add(object, "mirror", output->mirror_source ?
++		json_object_new_string(output->mirror_source->wlr_output->name) : NULL);
+ }
+ 
+ static void ipc_json_describe_enabled_output(struct sway_output *output,
+@@ -355,12 +357,17 @@ static void ipc_json_describe_enabled_ou
+ 	json_object_object_add(object, "adaptive_sync_status",
+ 		json_object_new_string(adaptive_sync_status));
+ 
+-	struct sway_workspace *ws = output_get_active_workspace(output);
+-	if (!sway_assert(ws, "Expected output to have a workspace")) {
+-		return;
++	if (output->mirror_source) {
++		// A mirror has no workspaces
++		json_object_object_add(object, "current_workspace", NULL);
++	} else {
++		struct sway_workspace *ws = output_get_active_workspace(output);
++		if (!sway_assert(ws, "Expected output to have a workspace")) {
++			return;
++		}
++		json_object_object_add(object, "current_workspace",
++				json_object_new_string(ws->name));
+ 	}
+-	json_object_object_add(object, "current_workspace",
+-			json_object_new_string(ws->name));
+ 
+ 	json_object *modes_array = json_object_new_array();
+ 	struct wlr_output_mode *mode;
+@@ -442,6 +449,7 @@ json_object *ipc_json_describe_non_deskt
+ 	ipc_json_describe_wlr_output(wlr_output, object);
+ 
+ 	json_object_object_add(object, "non_desktop", json_object_new_boolean(true));
++	json_object_object_add(object, "mirror", NULL);
+ 	json_object_object_add(object, "type", json_object_new_string("output"));
+ 	json_object_object_add(object, "name",
+ 				json_object_new_string(wlr_output->name));
+--- a/sway/ipc-server.c
++++ b/sway/ipc-server.c
+@@ -698,7 +698,19 @@ void ipc_client_handle_command(struct ip
+ 		}
+ 		struct sway_output *output;
+ 		wl_list_for_each(output, &root->all_outputs, link) {
+-			if (!output->enabled && output != root->fallback_output) {
++			if (output->mirror_source) {
++				// A mirror is active, but not part of the tree
++				json_object *output_json =
++					ipc_json_describe_node(&output->node);
++				json_object_object_del(output_json, "focused");
++				json_object_object_add(output_json, "focused",
++					json_object_new_boolean(false));
++				const char *subpixel = sway_wl_output_subpixel_to_string(
++					output->wlr_output->subpixel);
++				json_object_object_add(output_json, "subpixel_hinting",
++					json_object_new_string(subpixel));
++				json_object_array_add(outputs, output_json);
++			} else if (!output->enabled && output != root->fallback_output) {
+ 				json_object_array_add(outputs,
+ 						ipc_json_describe_disabled_output(output));
+ 			}
+--- a/sway/meson.build
++++ b/sway/meson.build
+@@ -206,6 +206,7 @@ sway_sources = files(
+ 	'commands/output/dpms.c',
+ 	'commands/output/enable.c',
+ 	'commands/output/max_render_time.c',
++	'commands/output/mirror.c',
+ 	'commands/output/mode.c',
+ 	'commands/output/position.c',
+ 	'commands/output/power.c',
+--- a/sway/sway-ipc.7.scd
++++ b/sway/sway-ipc.7.scd
+@@ -243,7 +243,14 @@ following properties:
+    _refresh_
+ |- rect
+ :  object
+-:  The bounds for the output consisting of _x_, _y_, _width_, and _height_
++:  The bounds for the output consisting of _x_, _y_, _width_, and _height_.
++   For a mirror, the bounds of its source
++|- mirror
++:  string
++:  The name of the output this output currently mirrors, or _null_ if it
++   doesn't mirror an output. A mirror is active, has its own _current\_mode_,
++   _scale_ and _transform_, no _current\_workspace_, and is not part of the
++   tree
+ 
+ 
+ *Example Reply:*
+@@ -286,7 +293,8 @@ following properties:
+ 			"width": 1920,
+ 			"height": 1080,
+ 			"refresh": 60000
+-		}
++		},
++		"mirror": null
+ 	}
+ ]
+ ```
+--- a/sway/sway-output.5.scd
++++ b/sway/sway-output.5.scd
+@@ -123,6 +123,33 @@ must be separated by one space. For exam
+ *output* <name> toggle
+ 	Toggle the specified output.
+ 
++*output* <name> mirror <source>|off
++	Makes the output _name_ show what the output _source_ shows, or stops
++	mirroring with _off_. Both outputs are referred to by name. The mirror
++	shows exactly the area of the layout that _source_ covers, including the
++	cursor, scaled by the same factor on both axes to the largest size that
++	fits the mirror, centred, with black bars filling the rest. Nothing
++	outside the source's area is shown, and the output scales don't change
++	the picture.
++
++	While it mirrors, the output takes no space in the layout, has no
++	workspaces (its workspaces move to other outputs as when it is disabled)
++	and is not advertised to clients as a _wl\_output_. Its _mode_,
++	_transform_ and _color\_profile_ still apply; its _scale_ doesn't change
++	the picture and its _position_ is ignored. Several outputs may mirror the
++	same source.
++
++	Mirroring only happens while both outputs are connected and enabled.
++	Otherwise, including while _source_ isn't connected yet, the output works
++	as a normal output, and it switches as _source_ connects, disconnects, is
++	enabled or disabled. While _source_ is powered off, the mirror is black.
++	A new _mirror_ for the same output replaces the previous one.
++
++	The output can't mirror itself, _name_ can't be _\*_, _source_ can't be an
++	output configured to mirror another output, and _name_ can't be an output
++	that another output is configured to mirror: there are no chains. _off_
++	always succeeds.
++
+ *output* <name> power on|off|toggle
+ 	Turns on or off the specified output.
+ 
