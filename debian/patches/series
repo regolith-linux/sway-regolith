@@ -12,4 +12,5 @@
 09-workspace-name-hex-escape.patch
 10-bind-none-disables-binding.patch
 11-validate-included-configs.patch
+12-i3-tree-moves.patch
 13-a11y-keyboard-monitor.patch

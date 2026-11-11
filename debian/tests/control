@@ -39,3 +39,7 @@ Restrictions: allow-stderr
 Tests: regolith-bind-none
 Depends: sway-regolith, regolith-wm-config, regolith-sway-root-config, regolith-wm-base-launchers, regolith-wm-navigation, regolith-sway-session, regolith-look-default, trawld, trawldb, dbus, cpp
 Restrictions: allow-stderr
+
+Tests: i3-tree-moves
+Depends: sway-regolith, dbus, jq, foot, wtype, fonts-dejavu-core
+Restrictions: allow-stderr
