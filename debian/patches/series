@@ -14,3 +14,7 @@
 11-validate-included-configs.patch
 12-i3-tree-moves.patch
 13-a11y-keyboard-monitor.patch
+15-move-promotion-fractions.patch
+16-floating-restore-next-to-sibling.patch
+17-sticky-keeps-focus-on-workspace-switch.patch
+18-move-direction-ppt.patch

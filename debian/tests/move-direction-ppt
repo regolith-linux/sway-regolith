@@ -1,0 +1,107 @@
+#!/bin/sh
+# 18-move-direction-ppt: move left|right|up|down <n> ppt moves a floating
+# window by that share of the output's size, as in i3 4.25.1.
+set -eu
+. debian/tests/lib-headless.sh
+in_dbus_session "$@"
+setup_runtime
+
+JQ_DEFS='
+def L: {"splith": "H", "splitv": "V", "tabbed": "T", "stacked": "S"}[.layout];
+def star: if .focused then "*" else "" end;
+def rep: if .app_id then .app_id + star
+	else L + "[" + ([.nodes[] | rep] | join(" ")) + "]" + star end;
+def ws($n): first(.. | objects | select(.type? == "workspace" and .name == $n));
+def focused_name: first(.. | objects | select(.focused? == true)
+	| if .app_id then .app_id else .type + " " + .name end);
+'
+
+# new_session OUTPUTS: restart headless sway with fresh state and OUTPUTS
+# 1280x800 outputs side by side.
+new_session() {
+	if [ -n "${SWAY_PID:-}" ]; then
+		kill "$SWAY_PID" 2>/dev/null || true
+		wait "$SWAY_PID" 2>/dev/null || true
+	fi
+	SESSION=$((${SESSION:-0} + 1))
+	export XDG_RUNTIME_DIR="$WORK/run-$SESSION"
+	mkdir -m 700 "$XDG_RUNTIME_DIR"
+	export WLR_HEADLESS_OUTPUTS="$1"
+	unset SWAYSOCK WAYLAND_DISPLAY
+	cat > "$WORK/config" <<-EOF
+	xwayland disable
+	default_border normal
+	focus_follows_mouse no
+	mouse_warping none
+	output HEADLESS-1 mode --custom 1280x800 position 0 0
+	output HEADLESS-2 mode --custom 1280x800 position 1280 0
+	workspace 1 output HEADLESS-1
+	workspace 2 output HEADLESS-2
+	EOF
+	[ "$1" = 2 ] || sed -i '/HEADLESS-2/d' "$WORK/config"
+	start_sway "$WORK/config"
+	for socket in "$XDG_RUNTIME_DIR"/wayland-*; do
+		case "$socket" in *.lock) continue ;; esac
+		export WAYLAND_DISPLAY="${socket##*/}"
+	done
+	cmd "workspace 1"
+}
+
+cmd() {
+	swaymsg "$1" > /dev/null || fail "command failed: $1"
+}
+
+# open NAME...: open foot windows whose app_id is NAME. Each one writes what
+# is typed into it to $WORK/typed-NAME.
+open() {
+	for name in "$@"; do
+		foot --app-id "$name" sh -c "stty -echo; exec cat > '$WORK/typed-$name'" \
+			> /dev/null 2>&1 &
+		i=0
+		until swaymsg -t get_tree -r | jq -e --arg n "$name" \
+				'.. | objects | select(.app_id? == $n and .focused)' > /dev/null; do
+			i=$((i + 1))
+			[ "$i" -le 50 ] || fail "window $name did not appear"
+			sleep 0.2
+		done
+	done
+}
+
+focus() {
+	cmd "[app_id=\"^$1\$\"] focus"
+}
+
+# query JQ: run a jq filter (with JQ_DEFS) on the current tree
+query() {
+	swaymsg -t get_tree -r | jq -r "$JQ_DEFS $1"
+}
+
+# expect NAME GOT WANT
+expect() {
+	echo "$1: $2"
+	[ "$2" = "$3" ] || fail "$1: expected $3"
+}
+
+# x,y of the floating window f after each command; ppt is a share of the
+# 1280x800 output, as in i3.
+new_session 1
+open f; cmd "floating enable"; cmd "resize set 400 300"; cmd "move absolute position 400 200"
+pos() {
+	query 'first(.. | objects | select(.app_id? == "f")) | "\(.rect.x) \(.rect.y)"'
+}
+step() { # step COMMAND DX DY
+	set -- "$1" "$2" "$3" $(pos)
+	cmd "$1"
+	set -- "$@" $(pos)
+	expect "'$1'" "$(($6 - $4)) $(($7 - $5))" "$2 $3"
+}
+step "move left 10 ppt" -128 0
+step "move down 10 ppt" 0 80
+step "move right 5ppt" 64 0
+step "move right 10px" 10 0
+step "move right 10 px" 10 0
+step "move up 20" 0 -20
+swaymsg "move left 10pt" > /dev/null 2>&1 && fail "'move left 10pt' was accepted"
+echo "'move left 10pt': rejected"
+
+echo "PASS: move-direction-ppt"

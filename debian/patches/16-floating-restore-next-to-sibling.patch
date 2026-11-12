@@ -1,0 +1,56 @@
+Description: Put a window back next to its sibling when it stops floating
+ Floating a tiled window and floating it back (floating toggle twice)
+ should leave the layout as it was, as in i3. When the workspace's most
+ recently focused tiling node was a container, sway appended the window
+ as that container's last child instead, so in T[1 2 3 4] with 3 then 2
+ focused, 2 came back after 4. The window now goes next to the most
+ recently focused window inside that container. The extra focus stack
+ update when a window starts floating is dropped, as it is no longer
+ needed.
+ .
+ Taken from the open upstream pull request (both commits squashed),
+ carried until it is merged. Applies to 1.11 unchanged.
+Author: siikamiika <siikamiika@users.noreply.github.com>
+Origin: https://github.com/swaywm/sway/pull/6594 (commits 90529532a7f7e10fa320d202b6692185ee3a08df, 1cfd53e0478cd499c9bd68f3813b9163377947a7)
+Bug: https://github.com/swaywm/sway/issues/6573
+Forwarded: not-needed
+Applied-Upstream: no
+Last-Update: 2026-11-11
+---
+--- a/sway/tree/container.c
++++ b/sway/tree/container.c
+@@ -1009,8 +1009,6 @@ void container_set_floating(struct sway_
+ 
+ 	struct sway_seat *seat = input_manager_current_seat();
+ 	struct sway_workspace *workspace = container->pending.workspace;
+-	struct sway_container *focus = seat_get_focused_container(seat);
+-	bool set_focus = focus == container;
+ 
+ 	if (enable) {
+ 		struct sway_container *old_parent = container->pending.parent;
+@@ -1031,10 +1029,6 @@ void container_set_floating(struct sway_
+ 		container_floating_set_default_size(container);
+ 		container_floating_resize_and_center(container);
+ 		if (old_parent) {
+-			if (set_focus) {
+-				seat_set_raw_focus(seat, &old_parent->node);
+-				seat_set_raw_focus(seat, &container->node);
+-			}
+ 			container_reap_empty(old_parent);
+ 		}
+ 	} else {
+@@ -1049,7 +1043,13 @@ void container_set_floating(struct sway_
+ 			if (reference->view) {
+ 				container_add_sibling(reference, container, 1);
+ 			} else {
+-				container_add_child(reference, container);
++				struct sway_container *sibling =
++					seat_get_focus_inactive_view(seat, &reference->node);
++				if (sibling) {
++					container_add_sibling(sibling, container, 1);
++				} else {
++					container_add_child(reference, container);
++				}
+ 			}
+ 			container->pending.width = reference->pending.width;
+ 			container->pending.height = reference->pending.height;

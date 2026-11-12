@@ -1,0 +1,40 @@
+Description: Reset the size of a container promoted by a directional move
+ When a directional move promotes a tiled container out of its parent
+ (for example W in H[X Y H[A W]] moved right), sway kept the container's
+ old size fraction, which was relative to its former parent, and reset
+ the fraction of the ancestor it left. The promoted container then got
+ an oversized share and its neighbours shrank. i3 resets the moved
+ container instead, as sway already does on its other reparenting paths.
+ .
+ Taken from the open upstream pull request, carried until it is merged.
+ Applied on top of 12-i3-tree-moves.patch: the reset goes after the focus
+ order update that patch adds, before the container is inserted.
+Author: Pablo <pablocpascual@gmail.com>
+Origin: https://github.com/swaywm/sway/pull/9249 (commit e3139d49ad62e07d0962fdae6d881b3914b17d30)
+Bug: https://github.com/swaywm/sway/issues/9248
+Forwarded: not-needed
+Applied-Upstream: no
+Last-Update: 2026-11-11
+---
+--- a/sway/commands/move.c
++++ b/sway/commands/move.c
+@@ -486,6 +486,9 @@ static bool container_move_in_direction(
+ 		struct sway_container *old_parent = container->pending.parent;
+ 		focus_order_for_insert(container, node_get_parent(&ancestor->node),
+ 				&ancestor->node);
++		// The container's fractions were relative to its former parent.
++		container->pending.height = container->pending.width = 0;
++		container->height_fraction = container->width_fraction = 0;
+ 		if (ancestor->pending.parent) {
+ 			// Container will move in with its parent
+ 			container_insert_child(ancestor->pending.parent, container,
+@@ -496,8 +499,8 @@ static bool container_move_in_direction(
+ 			workspace_insert_tiling(ancestor->pending.workspace, container,
+ 					index + (offs < 0 ? 0 : 1));
+ 		}
++		// The ancestor remains in the same parent, so preserve its fractions.
+ 		ancestor->pending.height = ancestor->pending.width = 0;
+-		ancestor->height_fraction = ancestor->width_fraction = 0;
+ 		if (old_parent) {
+ 			container_reap_empty(old_parent);
+ 		}
