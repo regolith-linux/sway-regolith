@@ -55,3 +55,7 @@ Restrictions: allow-stderr
 Tests: sticky-focus
 Depends: sway-regolith, dbus, jq, foot, wtype, fonts-dejavu-core
 Restrictions: allow-stderr
+
+Tests: move-direction-ppt
+Depends: sway-regolith, dbus, jq, foot, fonts-dejavu-core
+Restrictions: allow-stderr

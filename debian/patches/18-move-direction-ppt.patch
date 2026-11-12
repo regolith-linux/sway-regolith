@@ -1,0 +1,101 @@
+Description: Accept ppt in move left|right|up|down
+ i3 accepts move left|right|up|down <amount> ppt for floating windows and
+ moves them by that share of the output's size. Sway only knew px, so
+ move left 50 ppt moved the window by 50 pixels.
+ .
+ Taken from the open upstream pull request, carried until it is merged.
+ Adapted, following the upstream review and i3: the leftover debug
+ printf of the arguments is dropped; the compact forms 10px and 10ppt
+ keep working (the pull request rejected 10px); ppt is a share of the
+ output's width or height, as in i3's cmd_move_direction, where the pull
+ request used the window's own size; the man page says <amount>.
+Author: Absobel <imkonnu@gmail.com>
+Origin: https://github.com/swaywm/sway/pull/8743 (commit b690b99847c573c14695eb3d62674da02b51b385)
+Bug: https://github.com/swaywm/sway/issues/8566
+Forwarded: not-needed
+Applied-Upstream: no
+Last-Update: 2026-11-11
+---
+--- a/sway/commands/move.c
++++ b/sway/commands/move.c
+@@ -22,7 +22,7 @@
+ #include "util.h"
+ 
+ static const char expected_syntax[] =
+-	"Expected 'move <left|right|up|down> <[px] px>' or "
++	"Expected 'move <left|right|up|down> [<amount> [px|ppt]]' or "
+ 	"'move [--no-auto-back-and-forth] <container|window> [to] workspace <name>' or "
+ 	"'move <container|window|workspace> [to] output <name|direction>' or "
+ 	"'move <container|window> [to] mark <mark>'";
+@@ -799,12 +799,18 @@ static struct cmd_results *cmd_move_work
+ static struct cmd_results *cmd_move_in_direction(
+ 		enum wlr_direction direction, int argc, char **argv) {
+ 	int move_amt = 10;
++	bool is_ppt = false;
+ 	if (argc) {
+ 		char *inv;
+ 		move_amt = (int)strtol(argv[0], &inv, 10);
+-		if (*inv != '\0' && strcasecmp(inv, "px") != 0) {
++		if (strcasecmp(inv, "ppt") == 0) {
++			is_ppt = true;
++		} else if (*inv != '\0' && strcasecmp(inv, "px") != 0) {
+ 			return cmd_results_new(CMD_FAILURE, "Invalid distance specified");
+ 		}
++		if (argc > 1 && strcasecmp(argv[1], "ppt") == 0) {
++			is_ppt = true;
++		}
+ 	}
+ 
+ 	struct sway_container *container = config->handler_context.container;
+@@ -819,18 +825,20 @@ static struct cmd_results *cmd_move_in_d
+ 		}
+ 		double lx = container->pending.x;
+ 		double ly = container->pending.y;
++		// Like i3, ppt is a share of the output's size.
++		struct sway_output *output = container->pending.workspace->output;
+ 		switch (direction) {
+ 		case WLR_DIRECTION_LEFT:
+-			lx -= move_amt;
++			lx -= is_ppt ? output->width * ((double)move_amt / 100.0) : move_amt;
+ 			break;
+ 		case WLR_DIRECTION_RIGHT:
+-			lx += move_amt;
++			lx += is_ppt ? output->width * ((double)move_amt / 100.0) : move_amt;
+ 			break;
+ 		case WLR_DIRECTION_UP:
+-			ly -= move_amt;
++			ly -= is_ppt ? output->height * ((double)move_amt / 100.0) : move_amt;
+ 			break;
+ 		case WLR_DIRECTION_DOWN:
+-			ly += move_amt;
++			ly += is_ppt ? output->height * ((double)move_amt / 100.0) : move_amt;
+ 			break;
+ 		}
+ 		container_floating_move_to(container, lx, ly);
+@@ -1085,7 +1093,7 @@ static struct cmd_results *cmd_move_to_s
+ }
+ 
+ static const char expected_full_syntax[] = "Expected "
+-	"'move left|right|up|down [<amount> [px]]'"
++	"'move left|right|up|down [<amount> [px|ppt]]'"
+ 	" or 'move [--no-auto-back-and-forth] [window|container] [to] workspace"
+ 	"  <name>|next|prev|next_on_output|prev_on_output|current|(number <num>)'"
+ 	" or 'move [window|container] [to] output <name/id>|left|right|up|down'"
+--- a/sway/sway.5.scd
++++ b/sway/sway.5.scd
+@@ -231,10 +231,11 @@ set|plus|minus|toggle <amount>
+ 	the per-output *allow_tearing* setting. See *sway-output*(5) 
+ 	for further details.
+ 
+-*move* left|right|up|down [<px> px]
+-	Moves the focused container in the direction specified. The optional _px_
+-	argument specifies how many pixels to move the container. If unspecified,
+-	the default is 10 pixels. Pixels are ignored when moving tiled containers.
++*move* left|right|up|down [<amount> [px|ppt]]
++	Moves the focused container in the specified direction. The distance can be
++	specified in pixels or percentage points of the output's size, omitting the
++	unit defaults to pixels. If unspecified, the default is 10 pixels. The
++	distance is ignored when moving tiled containers.
+ 
+ *move* [absolute] position <pos_x> [px|ppt] <pos_y> [px|ppt]
+ 	Moves the focused container to the specified position in the workspace.
