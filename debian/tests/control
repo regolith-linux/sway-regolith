@@ -43,3 +43,7 @@ Restrictions: allow-stderr
 Tests: i3-tree-moves
 Depends: sway-regolith, dbus, jq, foot, wtype, fonts-dejavu-core
 Restrictions: allow-stderr
+
+Tests: move-promotion-fractions
+Depends: sway-regolith, dbus, jq, foot, fonts-dejavu-core
+Restrictions: allow-stderr
