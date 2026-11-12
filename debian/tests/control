@@ -47,3 +47,7 @@ Restrictions: allow-stderr
 Tests: move-promotion-fractions
 Depends: sway-regolith, dbus, jq, foot, fonts-dejavu-core
 Restrictions: allow-stderr
+
+Tests: floating-restore-position
+Depends: sway-regolith, dbus, jq, foot, fonts-dejavu-core
+Restrictions: allow-stderr
