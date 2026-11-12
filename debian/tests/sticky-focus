@@ -1,0 +1,125 @@
+#!/bin/sh
+# 17-sticky-keeps-focus-on-workspace-switch: a focused sticky window keeps
+# the focus and the keyboard when another workspace on its output is focused,
+# as in i3 4.25.1.
+set -eu
+. debian/tests/lib-headless.sh
+in_dbus_session "$@"
+setup_runtime
+
+JQ_DEFS='
+def L: {"splith": "H", "splitv": "V", "tabbed": "T", "stacked": "S"}[.layout];
+def star: if .focused then "*" else "" end;
+def rep: if .app_id then .app_id + star
+	else L + "[" + ([.nodes[] | rep] | join(" ")) + "]" + star end;
+def ws($n): first(.. | objects | select(.type? == "workspace" and .name == $n));
+def focused_name: first(.. | objects | select(.focused? == true)
+	| if .app_id then .app_id else .type + " " + .name end);
+'
+
+# new_session OUTPUTS: restart headless sway with fresh state and OUTPUTS
+# 1280x800 outputs side by side.
+new_session() {
+	if [ -n "${SWAY_PID:-}" ]; then
+		kill "$SWAY_PID" 2>/dev/null || true
+		wait "$SWAY_PID" 2>/dev/null || true
+	fi
+	SESSION=$((${SESSION:-0} + 1))
+	export XDG_RUNTIME_DIR="$WORK/run-$SESSION"
+	mkdir -m 700 "$XDG_RUNTIME_DIR"
+	export WLR_HEADLESS_OUTPUTS="$1"
+	unset SWAYSOCK WAYLAND_DISPLAY
+	cat > "$WORK/config" <<-EOF
+	xwayland disable
+	default_border normal
+	focus_follows_mouse no
+	mouse_warping none
+	output HEADLESS-1 mode --custom 1280x800 position 0 0
+	output HEADLESS-2 mode --custom 1280x800 position 1280 0
+	workspace 1 output HEADLESS-1
+	workspace 2 output HEADLESS-2
+	EOF
+	[ "$1" = 2 ] || sed -i '/HEADLESS-2/d' "$WORK/config"
+	start_sway "$WORK/config"
+	for socket in "$XDG_RUNTIME_DIR"/wayland-*; do
+		case "$socket" in *.lock) continue ;; esac
+		export WAYLAND_DISPLAY="${socket##*/}"
+	done
+	cmd "workspace 1"
+}
+
+cmd() {
+	swaymsg "$1" > /dev/null || fail "command failed: $1"
+}
+
+# open NAME...: open foot windows whose app_id is NAME. Each one writes what
+# is typed into it to $WORK/typed-NAME.
+open() {
+	for name in "$@"; do
+		foot --app-id "$name" sh -c "stty -echo; exec cat > '$WORK/typed-$name'" \
+			> /dev/null 2>&1 &
+		i=0
+		until swaymsg -t get_tree -r | jq -e --arg n "$name" \
+				'.. | objects | select(.app_id? == $n and .focused)' > /dev/null; do
+			i=$((i + 1))
+			[ "$i" -le 50 ] || fail "window $name did not appear"
+			sleep 0.2
+		done
+	done
+}
+
+focus() {
+	cmd "[app_id=\"^$1\$\"] focus"
+}
+
+# query JQ: run a jq filter (with JQ_DEFS) on the current tree
+query() {
+	swaymsg -t get_tree -r | jq -r "$JQ_DEFS $1"
+}
+
+# expect NAME GOT WANT
+expect() {
+	echo "$1: $2"
+	[ "$2" = "$3" ] || fail "$1: expected $3"
+}
+
+# Two sticky floating windows, s1 focused, then an empty workspace.
+new_session 1
+open s1; cmd "floating enable"; cmd "sticky enable"
+open s2; cmd "floating enable"; cmd "sticky enable"
+focus s1
+cmd "workspace 2"
+expect empty-workspace "$(query focused_name)" "s1"
+wtype -s 300 "typed
+"
+i=0
+until grep -q typed "$WORK/typed-s1" 2>/dev/null; do
+	i=$((i + 1))
+	[ "$i" -le 25 ] || fail "empty-workspace: the keyboard did not stay on s1"
+	sleep 0.2
+done
+echo "empty-workspace: typing reaches s1"
+cmd "workspace 1"
+expect back "$(query focused_name)" "s1"
+
+# A workspace with a tiled window: the sticky window keeps the focus too.
+new_session 1
+cmd "workspace 2"; open t1
+cmd "workspace 1"; open s1; cmd "floating enable"; cmd "sticky enable"
+cmd "workspace 2"
+expect tiled-workspace "$(query focused_name)" "s1"
+
+# A sticky window that is not focused does not take the focus.
+new_session 1
+open s1; cmd "floating enable"; cmd "sticky enable"; open t1
+cmd "workspace 2"
+expect unfocused-sticky "$(query focused_name)" "workspace 2"
+
+# A workspace on another output takes the focus.
+new_session 2
+cmd "workspace 2"; cmd "workspace 1"
+open s1; cmd "floating enable"; cmd "sticky enable"
+cmd "workspace 2"
+expect other-output "$(query focused_name)" "workspace 2"
+
+echo "PASS: sticky-focus"
