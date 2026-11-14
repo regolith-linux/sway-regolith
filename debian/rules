@@ -26,6 +26,7 @@ override_dh_missing:
 # unreachable (no session bus here), with GLib criticals made fatal.
 # 10-bind-none-disables-binding: key combinations with none validate quietly.
 # 11-validate-included-configs: sway -C fails on errors in included files.
+# 19-compositing-effects: sway -C checks the dimming and shadow settings.
 .PHONY: override_dh_auto_test
 override_dh_auto_test:
 	dh_auto_test
@@ -33,6 +34,7 @@ ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
 	sh debian/tests/set-from-resource-fallback.sh obj-$(DEB_HOST_GNU_TYPE)/sway/sway
 	sh debian/tests/bind-none.sh obj-$(DEB_HOST_GNU_TYPE)/sway/sway
 	sh debian/tests/validate-includes.sh obj-$(DEB_HOST_GNU_TYPE)/sway/sway
+	sh debian/tests/effects-config.sh obj-$(DEB_HOST_GNU_TYPE)/sway/sway
 endif
 
 .PHONY: override_dh_install
