@@ -1,3 +1,19 @@
+sway-regolith (1.11.2-2) resolute; urgency=medium
+
+  [ rego-port-bot ]
+  * fix: run config lines that start with a variable holding exec
+  * fix: keep a trailing \x in workspace names, like i3
+  * fix: make sway -C fail when an included file has errors
+  * feat: give Orca a keyboard monitor in sway
+  * feat: let the key none switch a binding off
+  * fix: build the same container trees as i3 on move and swap
+  * fix: reset the size of a container promoted by a directional move
+  * fix: put a window back next to its sibling when it stops floating
+  * fix: keep the focus on a sticky window when switching workspaces
+  * feat: accept ppt in move left, right, up and down
+
+ -- Regolith Linux <regolith.linux@gmail.com>  Sat, 14 Nov 2026 09:34:49 -0800
+
 sway-regolith (1.11.2-1) resolute; urgency=medium
 
   [ rego-port-bot ]
