@@ -1,0 +1,1614 @@
+Description: Enlarge an output live: output zoom and the zoom command
+ People with low vision, and anyone presenting their screen, need the
+ part of the desktop they work in shown larger without freezing it.
+ Raising an output's scale resizes every window, tells clients the
+ output changed and cannot follow the pointer; screenshot magnifiers
+ show a still image.
+ .
+ New settings:
+   output <name>|* zoom <factor>|off       factor 1 to 32 (1 = off)
+   zoom in|out [<step>]                     step > 0, default 1
+   zoom set <factor> | zoom off | zoom toggle
+   zoom_mouse_tracking centered|proportional|push|none  (proportional)
+   zoom_focus_tracking centered|push|none                (none)
+ The zoom command acts on the output under the pointer and behaves like
+ output <name> zoom; toggle restores that output's last factor above 1,
+ or 2. A refused value (out of range, nan, inf, a step of 0 or less, an
+ unknown mode) changes nothing.
+ .
+ The scene of an enlarged output is rendered into a private swapchain
+ the size of the output, then the shown rectangle of it (the view,
+ width/factor by height/factor, kept inside the output) is drawn
+ enlarged into the output's buffer, so output scale and transform keep
+ working. The view follows the pointer and, other than through the
+ pointer, keyboard focus. Windows, outputs and input coordinates are
+ not changed, so clients see nothing; a click acts on what the picture
+ shows under the pointer, and screencopy records the enlarged picture.
+ Software cursors are drawn enlarged with everything else, and direct
+ scan-out is off while an output is enlarged, since a client buffer
+ put straight on screen would show the layout unenlarged.
+ .
+ get_outputs reports a zoom object (factor, view in layout coordinates,
+ both tracking modes) for every active output; sway(5), sway-output(5)
+ and sway-ipc(7) document it all.
+ .
+ Not forwarded yet: upstream would rather build this on an output
+ viewport in the wlroots scene
+ (https://gitlab.freedesktop.org/wlroots/wlroots/-/issues/4019).
+Author: rego-port-bot <339843353+rego-port-bot@users.noreply.github.com>
+Bug: https://github.com/swaywm/sway/issues/2781
+Forwarded: no
+Last-Update: 2026-11-14
+---
+diff --git a/include/sway/commands.h b/include/sway/commands.h
+--- a/include/sway/commands.h
++++ b/include/sway/commands.h
+@@ -204,6 +204,9 @@ sway_cmd cmd_workspace;
+ sway_cmd cmd_workspace_layout;
+ sway_cmd cmd_ws_auto_back_and_forth;
+ sway_cmd cmd_xwayland;
++sway_cmd cmd_zoom;
++sway_cmd cmd_zoom_focus_tracking;
++sway_cmd cmd_zoom_mouse_tracking;
+ 
+ sway_cmd bar_cmd_bindcode;
+ sway_cmd bar_cmd_binding_mode_indicator;
+@@ -313,6 +316,7 @@ sway_cmd output_cmd_subpixel;
+ sway_cmd output_cmd_toggle;
+ sway_cmd output_cmd_transform;
+ sway_cmd output_cmd_unplug;
++sway_cmd output_cmd_zoom;
+ 
+ sway_cmd seat_cmd_attach;
+ sway_cmd seat_cmd_cursor;
+diff --git a/include/sway/config.h b/include/sway/config.h
+--- a/include/sway/config.h
++++ b/include/sway/config.h
+@@ -300,6 +300,7 @@ struct output_config {
+ 	bool set_color_transform;
+ 	struct wlr_color_transform *color_transform;
+ 	int allow_tearing;
++	double zoom; // -1 when unset, 1 when disabled
+ 
+ 	char *background;
+ 	char *background_option;
+@@ -476,6 +477,19 @@ enum mouse_warping_mode {
+ 	WARP_CONTAINER,
+ };
+ 
++enum zoom_mouse_tracking {
++	ZOOM_MOUSE_PROPORTIONAL,
++	ZOOM_MOUSE_CENTERED,
++	ZOOM_MOUSE_PUSH,
++	ZOOM_MOUSE_NONE,
++};
++
++enum zoom_focus_tracking {
++	ZOOM_FOCUS_NONE,
++	ZOOM_FOCUS_CENTERED,
++	ZOOM_FOCUS_PUSH,
++};
++
+ enum alignment {
+ 	ALIGN_LEFT,
+ 	ALIGN_CENTER,
+@@ -540,6 +554,8 @@ struct sway_config {
+ 	enum focus_follows_mouse_mode focus_follows_mouse;
+ 	enum mouse_warping_mode mouse_warping;
+ 	enum focus_wrapping_mode focus_wrapping;
++	enum zoom_mouse_tracking zoom_mouse_tracking;
++	enum zoom_focus_tracking zoom_focus_tracking;
+ 	bool active;
+ 	bool failed;
+ 	bool reloading;
+@@ -701,6 +717,12 @@ bool apply_output_configs(struct output_config **ocs, size_t ocs_len,
+ 
+ void apply_stored_output_configs(void);
+ 
++/**
++ * Apply the stored zoom factors to the outputs right away. Zoom does not
++ * need a modeset.
++ */
++void apply_stored_output_zoom(void);
++
+ /**
+  * store_output_config stores a new output config. An output may be matched by
+  * three different config types, in order of precedence: Identifier, name and
+diff --git a/include/sway/ipc-json.h b/include/sway/ipc-json.h
+--- a/include/sway/ipc-json.h
++++ b/include/sway/ipc-json.h
+@@ -10,6 +10,7 @@ json_object *ipc_json_get_version(void);
+ json_object *ipc_json_get_binding_mode(void);
+ 
+ json_object *ipc_json_describe_disabled_output(struct sway_output *o);
++json_object *ipc_json_describe_output_zoom(struct sway_output *o);
+ json_object *ipc_json_describe_non_desktop_output(struct sway_output_non_desktop *o);
+ json_object *ipc_json_describe_node(struct sway_node *node);
+ json_object *ipc_json_describe_node_recursive(struct sway_node *node);
+diff --git a/include/sway/output.h b/include/sway/output.h
+--- a/include/sway/output.h
++++ b/include/sway/output.h
+@@ -12,6 +12,10 @@
+ 
+ struct sway_server;
+ struct sway_container;
++struct sway_cursor;
++
++#define ZOOM_FACTOR_MIN 1.0
++#define ZOOM_FACTOR_MAX 32.0
+ 
+ struct sway_output_state {
+ 	list_t *workspaces;
+@@ -72,6 +76,18 @@ struct sway_output {
+ 	int max_render_time; // In milliseconds
+ 	struct wl_event_source *repaint_timer;
+ 	bool allow_tearing;
++
++	struct {
++		double factor; // 1 when the output is not enlarged
++		// Shown rectangle, in output-local layout coordinates
++		struct wlr_fbox view;
++		// Receives the unenlarged scene while the output is enlarged
++		struct wlr_swapchain *swapchain;
++		// Software cursors and composition are locked while enlarged
++		bool locked;
++		bool rendered; // the last frame was enlarged
++		uint64_t hidden_cursors;
++	} zoom;
+ };
+ 
+ struct sway_output_non_desktop {
+@@ -139,6 +155,65 @@ enum wlr_direction opposite_direction(enum wlr_direction d);
+ 
+ void handle_output_manager_apply(struct wl_listener *listener, void *data);
+ 
++/**
++ * Build the next frame of an output, enlarged when the output is zoomed.
++ * Works like wlr_scene_output_build_state().
++ */
++bool output_build_state(struct sway_output *output,
++	struct wlr_output_state *state,
++	const struct wlr_scene_output_state_options *options);
++
++/**
++ * Release the enlargement resources of an output that is being destroyed.
++ */
++void output_zoom_destroy(struct sway_output *output);
++
++/**
++ * Set the enlargement factor of an output. A factor of 1 disables it.
++ */
++void output_set_zoom(struct sway_output *output, double factor);
++
++/**
++ * The factor restored by "zoom toggle" for an output that is not enlarged.
++ */
++double output_get_zoom_toggle_factor(struct sway_output *output);
++
++/**
++ * Get the shown rectangle of an output in layout coordinates.
++ */
++void output_get_zoom_view(struct sway_output *output, struct wlr_fbox *view);
++
++/**
++ * Keep the shown rectangle valid after the output moved or changed size.
++ */
++void output_update_zoom_geometry(struct sway_output *output);
++
++/**
++ * Let the output under the cursor follow it, according to the configured
++ * zoom_mouse_tracking mode.
++ */
++void zoom_handle_cursor_motion(struct sway_cursor *cursor);
++
++/**
++ * Let the output showing a newly focused container follow it, according to
++ * the configured zoom_focus_tracking mode.
++ */
++void zoom_handle_focus(struct sway_container *con);
++
++/**
++ * Parse a zoom factor from ZOOM_FACTOR_MIN to ZOOM_FACTOR_MAX.
++ */
++bool zoom_parse_factor(const char *str, double *factor);
++
++/**
++ * Parse a positive zoom step.
++ */
++bool zoom_parse_step(const char *str, double *step);
++
++const char *zoom_mouse_tracking_to_string(enum zoom_mouse_tracking mode);
++
++const char *zoom_focus_tracking_to_string(enum zoom_focus_tracking mode);
++
+ void handle_output_manager_test(struct wl_listener *listener, void *data);
+ 
+ void handle_output_power_manager_set_mode(struct wl_listener *listener,
+diff --git a/sway/commands.c b/sway/commands.c
+--- a/sway/commands.c
++++ b/sway/commands.c
+@@ -98,6 +98,9 @@ static const struct cmd_handler handlers[] = {
+ 	{ "unbindsym", cmd_unbindsym },
+ 	{ "workspace", cmd_workspace },
+ 	{ "workspace_auto_back_and_forth", cmd_ws_auto_back_and_forth },
++	{ "zoom", cmd_zoom },
++	{ "zoom_focus_tracking", cmd_zoom_focus_tracking },
++	{ "zoom_mouse_tracking", cmd_zoom_mouse_tracking },
+ };
+ 
+ /* Config-time only commands. Keep alphabetized */
+diff --git a/sway/commands/output.c b/sway/commands/output.c
+--- a/sway/commands/output.c
++++ b/sway/commands/output.c
+@@ -30,6 +30,7 @@ static const struct cmd_handler output_handlers[] = {
+ 	{ "toggle", output_cmd_toggle },
+ 	{ "transform", output_cmd_transform },
+ 	{ "unplug", output_cmd_unplug },
++	{ "zoom", output_cmd_zoom },
+ };
+ 
+ struct cmd_results *cmd_output(int argc, char **argv) {
+@@ -104,6 +105,7 @@ struct cmd_results *cmd_output(int argc, char **argv) {
+ 	config->handler_context.leftovers.argv = NULL;
+ 
+ 	bool background = output->background;
++	bool zoom = output->zoom != -1;
+ 
+ 	store_output_config(output);
+ 
+@@ -114,6 +116,11 @@ struct cmd_results *cmd_output(int argc, char **argv) {
+ 	}
+ 	request_modeset();
+ 
++	if (zoom) {
++		// Enlargement only changes rendering, so it takes effect right away
++		apply_stored_output_zoom();
++	}
++
+ 	if (background && !spawn_swaybg()) {
+ 		return cmd_results_new(CMD_FAILURE,
+ 			"Failed to apply background configuration");
+diff --git a/sway/commands/output/zoom.c b/sway/commands/output/zoom.c
+new file mode 100644
+--- /dev/null
++++ b/sway/commands/output/zoom.c
+@@ -0,0 +1,27 @@
++#include <strings.h>
++#include "sway/commands.h"
++#include "sway/config.h"
++#include "sway/output.h"
++
++struct cmd_results *output_cmd_zoom(int argc, char **argv) {
++	if (!config->handler_context.output_config) {
++		return cmd_results_new(CMD_FAILURE, "Missing output config");
++	}
++	if (argc == 0) {
++		return cmd_results_new(CMD_INVALID, "Missing zoom argument");
++	}
++
++	double factor;
++	if (strcasecmp(argv[0], "off") == 0) {
++		factor = 1;
++	} else if (!zoom_parse_factor(argv[0], &factor)) {
++		return cmd_results_new(CMD_INVALID,
++			"Invalid zoom factor '%s': expected a number from %g to %g or 'off'",
++			argv[0], ZOOM_FACTOR_MIN, ZOOM_FACTOR_MAX);
++	}
++	config->handler_context.output_config->zoom = factor;
++
++	config->handler_context.leftovers.argc = argc - 1;
++	config->handler_context.leftovers.argv = argv + 1;
++	return NULL;
++}
+diff --git a/sway/commands/seat/cursor.c b/sway/commands/seat/cursor.c
+--- a/sway/commands/seat/cursor.c
++++ b/sway/commands/seat/cursor.c
+@@ -5,6 +5,7 @@
+ #include <wlr/types/wlr_pointer.h>
+ #include "sway/commands.h"
+ #include "sway/input/cursor.h"
++#include "sway/output.h"
+ #include "sway/server.h"
+ 
+ static struct cmd_results *press_or_release(struct sway_cursor *cursor,
+@@ -23,6 +24,7 @@ static struct cmd_results *handle_command(struct sway_cursor *cursor,
+ 		int delta_x = strtol(argv[1], NULL, 10);
+ 		int delta_y = strtol(argv[2], NULL, 10);
+ 		wlr_cursor_move(cursor->cursor, NULL, delta_x, delta_y);
++		zoom_handle_cursor_motion(cursor);
+ 		cursor_rebase(cursor);
+ 		wlr_seat_pointer_notify_frame(cursor->seat->wlr_seat);
+ 	} else if (strcasecmp(argv[0], "set") == 0) {
+@@ -33,6 +35,7 @@ static struct cmd_results *handle_command(struct sway_cursor *cursor,
+ 		float x = strtof(argv[1], NULL) / root->width;
+ 		float y = strtof(argv[2], NULL) / root->height;
+ 		wlr_cursor_warp_absolute(cursor->cursor, NULL, x, y);
++		zoom_handle_cursor_motion(cursor);
+ 		cursor_rebase(cursor);
+ 		wlr_seat_pointer_notify_frame(cursor->seat->wlr_seat);
+ 	} else {
+diff --git a/sway/commands/zoom.c b/sway/commands/zoom.c
+new file mode 100644
+--- /dev/null
++++ b/sway/commands/zoom.c
+@@ -0,0 +1,119 @@
++#include <math.h>
++#include <strings.h>
++#include <wlr/types/wlr_cursor.h>
++#include <wlr/types/wlr_output_layout.h>
++#include "sway/commands.h"
++#include "sway/config.h"
++#include "sway/input/cursor.h"
++#include "sway/input/input-manager.h"
++#include "sway/input/seat.h"
++#include "sway/output.h"
++#include "sway/tree/root.h"
++
++static const char expected_syntax[] =
++	"Expected 'zoom in|out [<step>]', 'zoom set <factor>' or 'zoom off|toggle'";
++
++enum zoom_action {
++	ZOOM_IN,
++	ZOOM_OUT,
++	ZOOM_SET,
++	ZOOM_OFF,
++	ZOOM_TOGGLE,
++};
++
++struct cmd_results *cmd_zoom(int argc, char **argv) {
++	struct cmd_results *error = NULL;
++	if ((error = checkarg(argc, "zoom", EXPECTED_AT_LEAST, 1))) {
++		return error;
++	}
++
++	enum zoom_action action;
++	double value = 1;
++	if (strcasecmp(argv[0], "in") == 0 || strcasecmp(argv[0], "out") == 0) {
++		action = strcasecmp(argv[0], "in") == 0 ? ZOOM_IN : ZOOM_OUT;
++		if (argc > 2) {
++			return cmd_results_new(CMD_INVALID, "%s", expected_syntax);
++		}
++		if (argc == 2 && !zoom_parse_step(argv[1], &value)) {
++			return cmd_results_new(CMD_INVALID,
++				"Invalid zoom step '%s': expected a positive number", argv[1]);
++		}
++	} else if (strcasecmp(argv[0], "set") == 0) {
++		action = ZOOM_SET;
++		if (argc != 2) {
++			return cmd_results_new(CMD_INVALID, "%s", expected_syntax);
++		}
++		if (strcasecmp(argv[1], "off") != 0 && !zoom_parse_factor(argv[1], &value)) {
++			return cmd_results_new(CMD_INVALID,
++				"Invalid zoom factor '%s': expected a number from %g to %g",
++				argv[1], ZOOM_FACTOR_MIN, ZOOM_FACTOR_MAX);
++		}
++	} else if (strcasecmp(argv[0], "off") == 0 && argc == 1) {
++		action = ZOOM_OFF;
++	} else if (strcasecmp(argv[0], "toggle") == 0 && argc == 1) {
++		action = ZOOM_TOGGLE;
++	} else {
++		return cmd_results_new(CMD_INVALID, "%s", expected_syntax);
++	}
++
++	if (config->validating) {
++		return cmd_results_new(CMD_SUCCESS, NULL);
++	}
++	if (!config->active) {
++		// The output under the pointer is only known once outputs exist
++		return cmd_results_new(CMD_DEFER, NULL);
++	}
++
++	struct sway_seat *seat = config->handler_context.seat;
++	if (!seat) {
++		seat = input_manager_current_seat();
++	}
++	struct wlr_cursor *cursor = seat->cursor->cursor;
++	struct wlr_output *wlr_output = wlr_output_layout_output_at(
++		root->output_layout, cursor->x, cursor->y);
++	if (!wlr_output) {
++		return cmd_results_new(CMD_FAILURE, "There is no output under the pointer");
++	}
++	struct sway_output *output = wlr_output->data;
++
++	// Start from the stored factor, which may not be applied yet
++	double factor = output->zoom.factor;
++	struct output_config *current = find_output_config(output);
++	if (current && current->zoom != -1) {
++		factor = current->zoom;
++	}
++	free_output_config(current);
++
++	switch (action) {
++	case ZOOM_IN:
++		factor = fmin(factor + value, ZOOM_FACTOR_MAX);
++		break;
++	case ZOOM_OUT:
++		factor = fmax(factor - value, ZOOM_FACTOR_MIN);
++		break;
++	case ZOOM_SET:
++		factor = value;
++		break;
++	case ZOOM_OFF:
++		factor = ZOOM_FACTOR_MIN;
++		break;
++	case ZOOM_TOGGLE:
++		factor = factor > ZOOM_FACTOR_MIN ?
++			ZOOM_FACTOR_MIN : output_get_zoom_toggle_factor(output);
++		break;
++	}
++
++	// Behave like "output <name> zoom <factor>"
++	struct output_config *oc = new_output_config(wlr_output->name);
++	if (!oc) {
++		return cmd_results_new(CMD_FAILURE, "Unable to allocate output config");
++	}
++	oc->zoom = factor;
++	store_output_config(oc);
++
++	if (!config->reading) {
++		output_set_zoom(output, factor);
++	}
++
++	return cmd_results_new(CMD_SUCCESS, NULL);
++}
+diff --git a/sway/commands/zoom_focus_tracking.c b/sway/commands/zoom_focus_tracking.c
+new file mode 100644
+--- /dev/null
++++ b/sway/commands/zoom_focus_tracking.c
+@@ -0,0 +1,24 @@
++#include <strings.h>
++#include "sway/commands.h"
++
++struct cmd_results *cmd_zoom_focus_tracking(int argc, char **argv) {
++	struct cmd_results *error = NULL;
++	if ((error = checkarg(argc, "zoom_focus_tracking", EXPECTED_EQUAL_TO, 1))) {
++		return error;
++	}
++
++	enum zoom_focus_tracking mode;
++	if (strcasecmp(argv[0], "centered") == 0) {
++		mode = ZOOM_FOCUS_CENTERED;
++	} else if (strcasecmp(argv[0], "push") == 0) {
++		mode = ZOOM_FOCUS_PUSH;
++	} else if (strcasecmp(argv[0], "none") == 0) {
++		mode = ZOOM_FOCUS_NONE;
++	} else {
++		return cmd_results_new(CMD_INVALID,
++			"Expected 'zoom_focus_tracking centered|push|none'");
++	}
++
++	config->zoom_focus_tracking = mode;
++	return cmd_results_new(CMD_SUCCESS, NULL);
++}
+diff --git a/sway/commands/zoom_mouse_tracking.c b/sway/commands/zoom_mouse_tracking.c
+new file mode 100644
+--- /dev/null
++++ b/sway/commands/zoom_mouse_tracking.c
+@@ -0,0 +1,26 @@
++#include <strings.h>
++#include "sway/commands.h"
++
++struct cmd_results *cmd_zoom_mouse_tracking(int argc, char **argv) {
++	struct cmd_results *error = NULL;
++	if ((error = checkarg(argc, "zoom_mouse_tracking", EXPECTED_EQUAL_TO, 1))) {
++		return error;
++	}
++
++	enum zoom_mouse_tracking mode;
++	if (strcasecmp(argv[0], "proportional") == 0) {
++		mode = ZOOM_MOUSE_PROPORTIONAL;
++	} else if (strcasecmp(argv[0], "centered") == 0) {
++		mode = ZOOM_MOUSE_CENTERED;
++	} else if (strcasecmp(argv[0], "push") == 0) {
++		mode = ZOOM_MOUSE_PUSH;
++	} else if (strcasecmp(argv[0], "none") == 0) {
++		mode = ZOOM_MOUSE_NONE;
++	} else {
++		return cmd_results_new(CMD_INVALID,
++			"Expected 'zoom_mouse_tracking centered|proportional|push|none'");
++	}
++
++	config->zoom_mouse_tracking = mode;
++	return cmd_results_new(CMD_SUCCESS, NULL);
++}
+diff --git a/sway/config.c b/sway/config.c
+--- a/sway/config.c
++++ b/sway/config.c
+@@ -272,6 +272,8 @@ static void config_defaults(struct sway_config *config) {
+ 	config->focus_follows_mouse = FOLLOWS_YES;
+ 	config->mouse_warping = WARP_OUTPUT;
+ 	config->focus_wrapping = WRAP_YES;
++	config->zoom_mouse_tracking = ZOOM_MOUSE_PROPORTIONAL;
++	config->zoom_focus_tracking = ZOOM_FOCUS_NONE;
+ 	config->validating = false;
+ 	config->reloading = false;
+ 	config->active = false;
+diff --git a/sway/config/output.c b/sway/config/output.c
+--- a/sway/config/output.c
++++ b/sway/config/output.c
+@@ -79,6 +79,7 @@ struct output_config *new_output_config(const char *name) {
+ 	oc->color_transform = NULL;
+ 	oc->power = -1;
+ 	oc->allow_tearing = -1;
++	oc->zoom = -1;
+ 	return oc;
+ }
+ 
+@@ -154,6 +155,9 @@ static void supersede_output_config(struct output_config *dst, struct output_con
+ 	if (src->allow_tearing != -1) {
+ 		dst->allow_tearing = -1;
+ 	}
++	if (src->zoom != -1) {
++		dst->zoom = -1;
++	}
+ }
+ 
+ // merge_output_config sets all fields in dst that were set in src
+@@ -229,6 +233,9 @@ static void merge_output_config(struct output_config *dst, struct output_config
+ 	if (src->allow_tearing != -1) {
+ 		dst->allow_tearing = src->allow_tearing;
+ 	}
++	if (src->zoom != -1) {
++		dst->zoom = src->zoom;
++	}
+ }
+ 
+ void store_output_config(struct output_config *oc) {
+@@ -271,11 +278,11 @@ void store_output_config(struct output_config *oc) {
+ 
+ 	sway_log(SWAY_DEBUG, "Config stored for output %s (enabled: %d) (%dx%d@%fHz "
+ 		"position %d,%d scale %f subpixel %s transform %d) (bg %s %s) (power %d) "
+-		"(max render time: %d) (allow tearing: %d)",
++		"(max render time: %d) (allow tearing: %d) (zoom %f)",
+ 		oc->name, oc->enabled, oc->width, oc->height, oc->refresh_rate,
+ 		oc->x, oc->y, oc->scale, sway_wl_output_subpixel_to_string(oc->subpixel),
+ 		oc->transform, oc->background, oc->background_option, oc->power,
+-		oc->max_render_time, oc->allow_tearing);
++		oc->max_render_time, oc->allow_tearing, oc->zoom);
+ 
+ 	// If the configuration was not merged into an existing configuration, add
+ 	// it to the list. Otherwise we're done with it and can free it.
+@@ -922,9 +929,8 @@ static bool apply_resolved_output_configs(struct matched_output_config *configs,
+ 				&swapchain_mgr, backend_state->output),
+ 			.color_transform = cfg->output->color_transform,
+ 		};
+-		struct wlr_scene_output *scene_output = cfg->output->scene_output;
+ 		struct wlr_output_state *state = &backend_state->base;
+-		if (!wlr_scene_output_build_state(scene_output, state, &opts)) {
++		if (!output_build_state(cfg->output, state, &opts)) {
+ 			sway_log(SWAY_ERROR, "Building output state for '%s' failed",
+ 				backend_state->output->name);
+ 			goto out;
+@@ -954,6 +960,10 @@ static bool apply_resolved_output_configs(struct matched_output_config *configs,
+ 		struct matched_output_config *cfg = &configs[idx];
+ 		output_update_position(cfg->output);
+ 		arrange_layers(cfg->output);
++		if (cfg->config && cfg->config->zoom != -1) {
++			output_set_zoom(cfg->output, cfg->config->zoom);
++		}
++		output_update_zoom_geometry(cfg->output);
+ 	}
+ 
+ 	arrange_root();
+@@ -1016,6 +1026,20 @@ bool apply_output_configs(struct output_config **ocs, size_t ocs_len,
+ 	return ok;
+ }
+ 
++void apply_stored_output_zoom(void) {
++	struct sway_output *output;
++	wl_list_for_each(output, &root->all_outputs, link) {
++		if (output == root->fallback_output) {
++			continue;
++		}
++		struct output_config *oc = find_output_config(output);
++		if (oc && oc->zoom != -1) {
++			output_set_zoom(output, oc->zoom);
++		}
++		free_output_config(oc);
++	}
++}
++
+ void apply_stored_output_configs(void) {
+ 	apply_output_configs((struct output_config **)config->output_configs->items,
+ 			config->output_configs->length, false, true);
+diff --git a/sway/desktop/output.c b/sway/desktop/output.c
+--- a/sway/desktop/output.c
++++ b/sway/desktop/output.c
+@@ -281,7 +281,7 @@ static int output_repaint_timer_handler(void *data) {
+ 
+ 	struct wlr_output_state pending;
+ 	wlr_output_state_init(&pending);
+-	if (!wlr_scene_output_build_state(output->scene_output, &pending, &opts)) {
++	if (!output_build_state(output, &pending, &opts)) {
+ 		wlr_output_state_finish(&pending);
+ 		return 0;
+ 	}
+@@ -434,6 +434,8 @@ static void begin_destroy(struct sway_output *output) {
+ 	wlr_scene_output_destroy(output->scene_output);
+ 	output->scene_output = NULL;
+ 
++	output_zoom_destroy(output);
++
+ 	if (output->enabled) {
+ 		output_disable(output);
+ 	}
+diff --git a/sway/desktop/zoom.c b/sway/desktop/zoom.c
+new file mode 100644
+--- /dev/null
++++ b/sway/desktop/zoom.c
+@@ -0,0 +1,654 @@
++#include <errno.h>
++#include <math.h>
++#include <stdlib.h>
++#include <string.h>
++#include <wlr/render/swapchain.h>
++#include <wlr/render/wlr_renderer.h>
++#include <wlr/types/wlr_cursor.h>
++#include <wlr/types/wlr_output.h>
++#include <wlr/types/wlr_output_layout.h>
++#include <wlr/util/box.h>
++#include <wlr/util/transform.h>
++#include "sway/config.h"
++#include "sway/input/cursor.h"
++#include "sway/input/input-manager.h"
++#include "sway/input/seat.h"
++#include "sway/output.h"
++#include "sway/tree/container.h"
++#include "sway/tree/root.h"
++#include "sway/tree/workspace.h"
++#include "list.h"
++#include "log.h"
++
++#define ZOOM_TOGGLE_DEFAULT 2.0
++
++/**
++ * The most recent factor above 1 used by each output, by output name, so that
++ * it outlives disconnecting the output.
++ */
++struct zoom_toggle_memory {
++	char *name;
++	double factor;
++};
++
++static list_t *toggle_memory = NULL;
++
++static struct zoom_toggle_memory *toggle_memory_find(const char *name) {
++	if (!toggle_memory) {
++		return NULL;
++	}
++	for (int i = 0; i < toggle_memory->length; i++) {
++		struct zoom_toggle_memory *memory = toggle_memory->items[i];
++		if (strcmp(memory->name, name) == 0) {
++			return memory;
++		}
++	}
++	return NULL;
++}
++
++static void toggle_memory_store(const char *name, double factor) {
++	struct zoom_toggle_memory *memory = toggle_memory_find(name);
++	if (!memory) {
++		memory = calloc(1, sizeof(*memory));
++		if (!memory) {
++			return;
++		}
++		memory->name = strdup(name);
++		if (!memory->name) {
++			free(memory);
++			return;
++		}
++		if (!toggle_memory) {
++			toggle_memory = create_list();
++		}
++		list_add(toggle_memory, memory);
++	}
++	memory->factor = factor;
++}
++
++double output_get_zoom_toggle_factor(struct sway_output *output) {
++	struct zoom_toggle_memory *memory =
++		toggle_memory_find(output->wlr_output->name);
++	return memory ? memory->factor : ZOOM_TOGGLE_DEFAULT;
++}
++
++static bool parse_number(const char *str, double *value) {
++	char *end;
++	errno = 0;
++	double number = strtod(str, &end);
++	if (end == str || *end != '\0' || errno != 0 || !isfinite(number)) {
++		return false;
++	}
++	*value = number;
++	return true;
++}
++
++bool zoom_parse_factor(const char *str, double *factor) {
++	double number;
++	if (!parse_number(str, &number) ||
++			number < ZOOM_FACTOR_MIN || number > ZOOM_FACTOR_MAX) {
++		return false;
++	}
++	*factor = number;
++	return true;
++}
++
++bool zoom_parse_step(const char *str, double *step) {
++	double number;
++	if (!parse_number(str, &number) || number <= 0) {
++		return false;
++	}
++	*step = number;
++	return true;
++}
++
++const char *zoom_mouse_tracking_to_string(enum zoom_mouse_tracking mode) {
++	switch (mode) {
++	case ZOOM_MOUSE_PROPORTIONAL:
++		return "proportional";
++	case ZOOM_MOUSE_CENTERED:
++		return "centered";
++	case ZOOM_MOUSE_PUSH:
++		return "push";
++	case ZOOM_MOUSE_NONE:
++		return "none";
++	}
++	return "unknown";
++}
++
++const char *zoom_focus_tracking_to_string(enum zoom_focus_tracking mode) {
++	switch (mode) {
++	case ZOOM_FOCUS_CENTERED:
++		return "centered";
++	case ZOOM_FOCUS_PUSH:
++		return "push";
++	case ZOOM_FOCUS_NONE:
++		return "none";
++	}
++	return "unknown";
++}
++
++static bool output_is_zoomed(struct sway_output *output) {
++	return output->enabled && output->zoom.factor > ZOOM_FACTOR_MIN &&
++		output->width > 0 && output->height > 0;
++}
++
++void output_get_zoom_view(struct sway_output *output, struct wlr_fbox *view) {
++	if (output_is_zoomed(output)) {
++		*view = output->zoom.view;
++	} else {
++		*view = (struct wlr_fbox){
++			.width = output->width,
++			.height = output->height,
++		};
++	}
++	view->x += output->lx;
++	view->y += output->ly;
++}
++
++/**
++ * Keep the shown rectangle inside the output.
++ */
++static void clamp_view(struct sway_output *output, struct wlr_fbox *view) {
++	view->x = fmin(fmax(view->x, 0), output->width - view->width);
++	view->y = fmin(fmax(view->y, 0), output->height - view->height);
++}
++
++static void zoom_damage(struct sway_output *output) {
++	wlr_damage_ring_add_whole(&output->scene_output->damage_ring);
++	wlr_output_update_needs_frame(output->wlr_output);
++}
++
++static void set_view(struct sway_output *output, const struct wlr_fbox *view) {
++	if (wlr_fbox_equal(&output->zoom.view, view)) {
++		return;
++	}
++	output->zoom.view = *view;
++	if (output->zoom.rendered || output_is_zoomed(output)) {
++		zoom_damage(output);
++	}
++}
++
++static void set_output_locks(struct sway_output *output, bool lock) {
++	if (lock == output->zoom.locked) {
++		return;
++	}
++	// The pointer has to be enlarged along with everything else, and the
++	// enlarged frame is always composited: a client buffer scanned out
++	// directly would show the layout unenlarged
++	wlr_output_lock_software_cursors(output->wlr_output, lock);
++	wlr_output_lock_attach_render(output->wlr_output, lock);
++	output->zoom.locked = lock;
++}
++
++static void update_output_locks(struct sway_output *output) {
++	set_output_locks(output, output_is_zoomed(output));
++}
++
++void output_zoom_destroy(struct sway_output *output) {
++	set_output_locks(output, false);
++	wlr_swapchain_destroy(output->zoom.swapchain);
++	output->zoom.swapchain = NULL;
++}
++
++/**
++ * Get the cursor position in output-local coordinates, if it is on the output.
++ */
++static bool cursor_on_output(struct sway_output *output,
++		struct sway_cursor *cursor, double *x, double *y) {
++	if (!cursor) {
++		return false;
++	}
++	struct wlr_output *wlr_output = wlr_output_layout_output_at(
++		root->output_layout, cursor->cursor->x, cursor->cursor->y);
++	if (!wlr_output || wlr_output != output->wlr_output) {
++		return false;
++	}
++	*x = cursor->cursor->x - output->lx;
++	*y = cursor->cursor->y - output->ly;
++	return true;
++}
++
++static struct sway_cursor *current_cursor(void) {
++	struct sway_seat *seat = input_manager_current_seat();
++	return seat ? seat->cursor : NULL;
++}
++
++/**
++ * Apply the pointer tracking mode once for a pointer on the output.
++ */
++static void follow_pointer(struct sway_output *output, double x, double y,
++		struct wlr_fbox *view) {
++	double factor = output->zoom.factor;
++	switch (config->zoom_mouse_tracking) {
++	case ZOOM_MOUSE_PROPORTIONAL:
++		view->x = x * (1 - 1 / factor);
++		view->y = y * (1 - 1 / factor);
++		break;
++	case ZOOM_MOUSE_CENTERED:
++		view->x = x - view->width / 2;
++		view->y = y - view->height / 2;
++		break;
++	case ZOOM_MOUSE_PUSH:
++		if (x < view->x) {
++			view->x = x;
++		} else if (x > view->x + view->width) {
++			view->x = x - view->width;
++		}
++		if (y < view->y) {
++			view->y = y;
++		} else if (y > view->y + view->height) {
++			view->y = y - view->height;
++		}
++		break;
++	case ZOOM_MOUSE_NONE:
++		return;
++	}
++	clamp_view(output, view);
++}
++
++void output_set_zoom(struct sway_output *output, double factor) {
++	if (factor == output->zoom.factor) {
++		return;
++	}
++	double previous = output->zoom.factor;
++	bool was_zoomed = output_is_zoomed(output);
++	output->zoom.factor = factor;
++	if (factor > ZOOM_FACTOR_MIN) {
++		toggle_memory_store(output->wlr_output->name, factor);
++	}
++	sway_log(SWAY_DEBUG, "Zoom of %s changed from %f to %f",
++		output->wlr_output->name, previous, factor);
++
++	if (!output->enabled || output->width <= 0 || output->height <= 0) {
++		// The shown rectangle is worked out once the output is enabled
++		output->zoom.view = (struct wlr_fbox){0};
++		return;
++	}
++
++	// Resize the shown rectangle around its centre, or around the pointer or
++	// the middle of the output when it was not enlarged
++	double x, y;
++	bool on_output = cursor_on_output(output, current_cursor(), &x, &y);
++	double center_x = output->width / 2.0, center_y = output->height / 2.0;
++	if (was_zoomed) {
++		center_x = output->zoom.view.x + output->zoom.view.width / 2;
++		center_y = output->zoom.view.y + output->zoom.view.height / 2;
++	} else if (on_output) {
++		center_x = x;
++		center_y = y;
++	}
++
++	struct wlr_fbox view = {
++		.width = output->width / factor,
++		.height = output->height / factor,
++	};
++	view.x = center_x - view.width / 2;
++	view.y = center_y - view.height / 2;
++	clamp_view(output, &view);
++	if (on_output) {
++		follow_pointer(output, x, y, &view);
++	}
++
++	output->zoom.view = view;
++	update_output_locks(output);
++	zoom_damage(output);
++}
++
++void output_update_zoom_geometry(struct sway_output *output) {
++	if (!output_is_zoomed(output)) {
++		update_output_locks(output);
++		return;
++	}
++
++	struct wlr_fbox view = output->zoom.view;
++	double width = output->width / output->zoom.factor;
++	double height = output->height / output->zoom.factor;
++	if (view.width != width || view.height != height) {
++		double center_x = output->width / 2.0, center_y = output->height / 2.0;
++		if (view.width > 0 && view.height > 0) {
++			center_x = view.x + view.width / 2;
++			center_y = view.y + view.height / 2;
++		}
++		view.width = width;
++		view.height = height;
++		view.x = center_x - width / 2;
++		view.y = center_y - height / 2;
++	}
++	clamp_view(output, &view);
++
++	output->zoom.view = view;
++	update_output_locks(output);
++	zoom_damage(output);
++}
++
++void zoom_handle_cursor_motion(struct sway_cursor *cursor) {
++	if (config->zoom_mouse_tracking == ZOOM_MOUSE_NONE) {
++		return;
++	}
++	struct wlr_output *wlr_output = wlr_output_layout_output_at(
++		root->output_layout, cursor->cursor->x, cursor->cursor->y);
++	if (!wlr_output) {
++		return;
++	}
++	struct sway_output *output = wlr_output->data;
++	if (!output || !output_is_zoomed(output)) {
++		return;
++	}
++
++	struct wlr_fbox view = output->zoom.view;
++	follow_pointer(output, cursor->cursor->x - output->lx,
++		cursor->cursor->y - output->ly, &view);
++	set_view(output, &view);
++}
++
++void zoom_handle_focus(struct sway_container *con) {
++	if (config->zoom_focus_tracking == ZOOM_FOCUS_NONE || !con->view) {
++		return;
++	}
++	struct sway_workspace *ws = con->pending.workspace;
++	struct sway_output *output = ws ? ws->output : NULL;
++	if (!output || !output_is_zoomed(output)) {
++		return;
++	}
++
++	struct wlr_fbox window = {
++		.x = con->pending.x - output->lx,
++		.y = con->pending.y - output->ly,
++		.width = con->pending.width,
++		.height = con->pending.height,
++	};
++	struct wlr_fbox view = output->zoom.view;
++	switch (config->zoom_focus_tracking) {
++	case ZOOM_FOCUS_CENTERED:
++		view.x = window.x + window.width / 2 - view.width / 2;
++		view.y = window.y + window.height / 2 - view.height / 2;
++		break;
++	case ZOOM_FOCUS_PUSH:
++		if (window.width > view.width || window.height > view.height) {
++			// Too big to show whole: show its top-left corner
++			view.x = window.x;
++			view.y = window.y;
++			break;
++		}
++		if (window.x < view.x) {
++			view.x = window.x;
++		} else if (window.x + window.width > view.x + view.width) {
++			view.x = window.x + window.width - view.width;
++		}
++		if (window.y < view.y) {
++			view.y = window.y;
++		} else if (window.y + window.height > view.y + view.height) {
++			view.y = window.y + window.height - view.height;
++		}
++		break;
++	case ZOOM_FOCUS_NONE:
++		return;
++	}
++	clamp_view(output, &view);
++	set_view(output, &view);
++}
++
++static bool output_state_changes_geometry(struct wlr_output *output,
++		const struct wlr_output_state *state) {
++	if ((state->committed & WLR_OUTPUT_STATE_ENABLED) && !state->enabled) {
++		return true;
++	}
++	if ((state->committed & WLR_OUTPUT_STATE_SCALE) &&
++			state->scale != output->scale) {
++		return true;
++	}
++	if ((state->committed & WLR_OUTPUT_STATE_TRANSFORM) &&
++			state->transform != output->transform) {
++		return true;
++	}
++	if (state->committed & WLR_OUTPUT_STATE_MODE) {
++		int width = 0, height = 0;
++		switch (state->mode_type) {
++		case WLR_OUTPUT_STATE_MODE_FIXED:
++			width = state->mode->width;
++			height = state->mode->height;
++			break;
++		case WLR_OUTPUT_STATE_MODE_CUSTOM:
++			width = state->custom_mode.width;
++			height = state->custom_mode.height;
++			break;
++		}
++		if (width != output->width || height != output->height) {
++			return true;
++		}
++	}
++	return false;
++}
++
++/**
++ * Hide the cursors whose hot spot is outside the shown rectangle: they would
++ * be drawn outside the output. Returns the hidden cursors as a bit set.
++ */
++static uint64_t hide_cursors_outside_view(struct sway_output *output) {
++	struct wlr_output *wlr_output = output->wlr_output;
++	const struct wlr_fbox *view = &output->zoom.view;
++	uint64_t hidden = 0;
++	int i = 0;
++	struct wlr_output_cursor *cursor;
++	wl_list_for_each(cursor, &wlr_output->cursors, link) {
++		if (i >= 64) {
++			break;
++		}
++		double x = cursor->x / wlr_output->scale;
++		double y = cursor->y / wlr_output->scale;
++		if (cursor->enabled && (x < view->x || x >= view->x + view->width ||
++				y < view->y || y >= view->y + view->height)) {
++			cursor->enabled = false;
++			hidden |= (uint64_t)1 << i;
++		}
++		i++;
++	}
++	return hidden;
++}
++
++static void restore_cursors(struct sway_output *output, uint64_t hidden) {
++	int i = 0;
++	struct wlr_output_cursor *cursor;
++	wl_list_for_each(cursor, &output->wlr_output->cursors, link) {
++		if (i >= 64) {
++			break;
++		}
++		if (hidden & ((uint64_t)1 << i)) {
++			cursor->enabled = true;
++		}
++		i++;
++	}
++}
++
++static bool ensure_zoom_swapchain(struct sway_output *output,
++		struct wlr_swapchain *target) {
++	struct wlr_swapchain *swapchain = output->zoom.swapchain;
++	if (swapchain && swapchain->width == target->width &&
++			swapchain->height == target->height &&
++			swapchain->format.format == target->format.format) {
++		return true;
++	}
++	wlr_swapchain_destroy(swapchain);
++	output->zoom.swapchain = wlr_swapchain_create(output->wlr_output->allocator,
++		target->width, target->height, &target->format);
++	return output->zoom.swapchain != NULL;
++}
++
++/**
++ * Replace the frame in the state by the shown rectangle of it, enlarged to
++ * fill the output.
++ */
++static bool render_enlarged(struct sway_output *output,
++		struct wlr_output_state *state, struct wlr_swapchain *target) {
++	struct wlr_output *wlr_output = output->wlr_output;
++	struct wlr_renderer *renderer = wlr_output->renderer;
++
++	struct wlr_texture *texture =
++		wlr_texture_from_buffer(renderer, state->buffer);
++	if (!texture) {
++		return false;
++	}
++	struct wlr_buffer *buffer = wlr_swapchain_acquire(target);
++	if (!buffer) {
++		wlr_texture_destroy(texture);
++		return false;
++	}
++
++	// The shown rectangle in buffer coordinates
++	const struct wlr_fbox *view = &output->zoom.view;
++	struct wlr_fbox src = {
++		.x = view->x * wlr_output->scale,
++		.y = view->y * wlr_output->scale,
++		.width = view->width * wlr_output->scale,
++		.height = view->height * wlr_output->scale,
++	};
++	int width, height;
++	wlr_output_transformed_resolution(wlr_output, &width, &height);
++	wlr_fbox_transform(&src, &src,
++		wlr_output_transform_invert(wlr_output->transform), width, height);
++
++	// Sample whole source pixels, and place them so that the shown rectangle
++	// fills the buffer exactly; some renderers round fractional sources.
++	double scale_x = buffer->width / src.width;
++	double scale_y = buffer->height / src.height;
++	int x0 = fmax(floor(src.x), 0);
++	int y0 = fmax(floor(src.y), 0);
++	int x1 = fmin(ceil(src.x + src.width), texture->width);
++	int y1 = fmin(ceil(src.y + src.height), texture->height);
++	struct wlr_box dst_box = {
++		.x = round((x0 - src.x) * scale_x),
++		.y = round((y0 - src.y) * scale_y),
++	};
++	dst_box.width = round((x1 - src.x) * scale_x) - dst_box.x;
++	dst_box.height = round((y1 - src.y) * scale_y) - dst_box.y;
++
++	struct wlr_render_pass *pass =
++		wlr_renderer_begin_buffer_pass(renderer, buffer, NULL);
++	if (!pass) {
++		wlr_texture_destroy(texture);
++		wlr_buffer_unlock(buffer);
++		return false;
++	}
++
++	pixman_region32_t clip;
++	pixman_region32_init_rect(&clip, 0, 0, buffer->width, buffer->height);
++	wlr_render_pass_add_rect(pass, &(struct wlr_render_rect_options){
++		.box = { .width = buffer->width, .height = buffer->height },
++		.color = { .r = 0, .g = 0, .b = 0, .a = 1 },
++	});
++	bool wait = state->committed & WLR_OUTPUT_STATE_WAIT_TIMELINE;
++	wlr_render_pass_add_texture(pass, &(struct wlr_render_texture_options){
++		.texture = texture,
++		.src_box = {
++			.x = x0,
++			.y = y0,
++			.width = x1 - x0,
++			.height = y1 - y0,
++		},
++		.dst_box = dst_box,
++		.clip = &clip,
++		.filter_mode = WLR_SCALE_FILTER_NEAREST,
++		.blend_mode = WLR_RENDER_BLEND_MODE_NONE,
++		.wait_timeline = wait ? state->wait_timeline : NULL,
++		.wait_point = wait ? state->wait_point : 0,
++	});
++	pixman_region32_fini(&clip);
++
++	bool ok = wlr_render_pass_submit(pass);
++	wlr_texture_destroy(texture);
++	if (!ok) {
++		wlr_buffer_unlock(buffer);
++		return false;
++	}
++
++	// The enlarged frame was rendered after waiting for the scene
++	state->committed &= ~WLR_OUTPUT_STATE_WAIT_TIMELINE;
++	wlr_output_state_set_buffer(state, buffer);
++	wlr_buffer_unlock(buffer);
++
++	pixman_region32_t damage;
++	pixman_region32_init_rect(&damage, 0, 0, buffer->width, buffer->height);
++	wlr_output_state_set_damage(state, &damage);
++	pixman_region32_fini(&damage);
++	return true;
++}
++
++static void set_whole_damage(struct sway_output *output,
++		struct wlr_output_state *state) {
++	pixman_region32_t damage;
++	pixman_region32_init_rect(&damage, 0, 0,
++		output->wlr_output->width, output->wlr_output->height);
++	wlr_output_state_set_damage(state, &damage);
++	pixman_region32_fini(&damage);
++}
++
++bool output_build_state(struct sway_output *output,
++		struct wlr_output_state *state,
++		const struct wlr_scene_output_state_options *options) {
++	struct wlr_output *wlr_output = output->wlr_output;
++	struct wlr_scene_output *scene_output = output->scene_output;
++
++	if (!output_is_zoomed(output) ||
++			output_state_changes_geometry(wlr_output, state)) {
++		bool was_rendered = output->zoom.rendered;
++		output->zoom.rendered = false;
++		if (!output_is_zoomed(output) && output->zoom.swapchain) {
++			wlr_swapchain_destroy(output->zoom.swapchain);
++			output->zoom.swapchain = NULL;
++		}
++		if (!wlr_scene_output_build_state(scene_output, state, options)) {
++			return false;
++		}
++		if (was_rendered && (state->committed & WLR_OUTPUT_STATE_BUFFER)) {
++			// Replace the whole enlarged picture
++			set_whole_damage(output, state);
++		}
++		return true;
++	}
++
++	struct wlr_swapchain *target = options ? options->swapchain : NULL;
++	if (!target) {
++		if (!wlr_output_configure_primary_swapchain(wlr_output, state,
++				&wlr_output->swapchain)) {
++			return false;
++		}
++		target = wlr_output->swapchain;
++	}
++	if (!ensure_zoom_swapchain(output, target)) {
++		sway_log(SWAY_ERROR, "Unable to allocate the zoom buffers of %s",
++			wlr_output->name);
++		return false;
++	}
++
++	struct wlr_scene_output_state_options scene_options = {0};
++	if (options) {
++		scene_options = *options;
++	}
++	scene_options.swapchain = output->zoom.swapchain;
++
++	uint64_t hidden = hide_cursors_outside_view(output);
++	if (hidden != output->zoom.hidden_cursors || !output->zoom.rendered) {
++		wlr_damage_ring_add_whole(&scene_output->damage_ring);
++	}
++	output->zoom.hidden_cursors = hidden;
++	bool ok = wlr_scene_output_build_state(scene_output, state, &scene_options);
++	restore_cursors(output, hidden);
++	if (!ok) {
++		return false;
++	}
++	if (!(state->committed & WLR_OUTPUT_STATE_BUFFER)) {
++		return true;
++	}
++
++	if (!render_enlarged(output, state, target)) {
++		sway_log(SWAY_ERROR, "Unable to render the enlarged frame of %s",
++			wlr_output->name);
++		// Make sure the next frame is drawn in full
++		wlr_damage_ring_add_whole(&scene_output->damage_ring);
++		output->zoom.rendered = false;
++		return false;
++	}
++	output->zoom.rendered = true;
++	return true;
++}
+diff --git a/sway/input/seat.c b/sway/input/seat.c
+--- a/sway/input/seat.c
++++ b/sway/input/seat.c
+@@ -35,6 +35,12 @@
+ #include "sway/tree/view.h"
+ #include "sway/tree/workspace.h"
+ 
++/**
++ * Nesting depth of pointer, touch and tablet event handling, during which
++ * focus changes are caused by the pointer.
++ */
++static int pointer_event_depth = 0;
++
+ static void seat_device_destroy(struct sway_seat_device *seat_device) {
+ 	if (!seat_device) {
+ 		return;
+@@ -1370,6 +1376,11 @@ static void seat_set_workspace_focus(struct sway_seat *seat, struct sway_node *n
+ 		// the workspace needs to be arranged
+ 		arrange_workspace(new_workspace);
+ 	}
++
++	// Focus that follows the pointer or a click must not pan the zoom
++	if (container && container->view && pointer_event_depth == 0) {
++		zoom_handle_focus(container);
++	}
+ }
+ 
+ void seat_set_focus(struct sway_seat *seat, struct sway_node *node) {
+@@ -1677,40 +1688,53 @@ void seatop_button(struct sway_seat *seat, uint32_t time_msec,
+ 		struct wlr_input_device *device, uint32_t button,
+ 		enum wl_pointer_button_state state) {
+ 	if (seat->seatop_impl->button) {
++		pointer_event_depth++;
+ 		seat->seatop_impl->button(seat, time_msec, device, button, state);
++		pointer_event_depth--;
+ 	}
+ }
+ 
+ void seatop_pointer_motion(struct sway_seat *seat, uint32_t time_msec) {
++	zoom_handle_cursor_motion(seat->cursor);
+ 	if (seat->seatop_impl->pointer_motion) {
++		pointer_event_depth++;
+ 		seat->seatop_impl->pointer_motion(seat, time_msec);
++		pointer_event_depth--;
+ 	}
+ }
+ 
+ void seatop_pointer_axis(struct sway_seat *seat,
+ 		struct wlr_pointer_axis_event *event) {
+ 	if (seat->seatop_impl->pointer_axis) {
++		pointer_event_depth++;
+ 		seat->seatop_impl->pointer_axis(seat, event);
++		pointer_event_depth--;
+ 	}
+ }
+ 
+ void seatop_touch_motion(struct sway_seat *seat, struct wlr_touch_motion_event *event,
+ 		double lx, double ly) {
+ 	if (seat->seatop_impl->touch_motion) {
++		pointer_event_depth++;
+ 		seat->seatop_impl->touch_motion(seat, event, lx, ly);
++		pointer_event_depth--;
+ 	}
+ }
+ 
+ void seatop_touch_up(struct sway_seat *seat, struct wlr_touch_up_event *event) {
+ 	if (seat->seatop_impl->touch_up) {
++		pointer_event_depth++;
+ 		seat->seatop_impl->touch_up(seat, event);
++		pointer_event_depth--;
+ 	}
+ }
+ 
+ void seatop_touch_down(struct sway_seat *seat, struct wlr_touch_down_event *event,
+ 		double lx, double ly) {
+ 	if (seat->seatop_impl->touch_down) {
++		pointer_event_depth++;
+ 		seat->seatop_impl->touch_down(seat, event, lx, ly);
++		pointer_event_depth--;
+ 	}
+ }
+ 
+@@ -1724,14 +1748,19 @@ void seatop_tablet_tool_tip(struct sway_seat *seat,
+ 		struct sway_tablet_tool *tool, uint32_t time_msec,
+ 		enum wlr_tablet_tool_tip_state state) {
+ 	if (seat->seatop_impl->tablet_tool_tip) {
++		pointer_event_depth++;
+ 		seat->seatop_impl->tablet_tool_tip(seat, tool, time_msec, state);
++		pointer_event_depth--;
+ 	}
+ }
+ 
+ void seatop_tablet_tool_motion(struct sway_seat *seat,
+ 		struct sway_tablet_tool *tool, uint32_t time_msec) {
+ 	if (seat->seatop_impl->tablet_tool_motion) {
++		zoom_handle_cursor_motion(seat->cursor);
++		pointer_event_depth++;
+ 		seat->seatop_impl->tablet_tool_motion(seat, tool, time_msec);
++		pointer_event_depth--;
+ 	} else {
+ 		seatop_pointer_motion(seat, time_msec);
+ 	}
+diff --git a/sway/ipc-json.c b/sway/ipc-json.c
+--- a/sway/ipc-json.c
++++ b/sway/ipc-json.c
+@@ -405,6 +405,29 @@ static void ipc_json_describe_enabled_output(struct sway_output *output,
+ 	json_object_object_add(object, "allow_tearing", json_object_new_boolean(output->allow_tearing));
+ }
+ 
++json_object *ipc_json_describe_output_zoom(struct sway_output *output) {
++	struct wlr_fbox view;
++	output_get_zoom_view(output, &view);
++
++	json_object *view_object = json_object_new_object();
++	json_object_object_add(view_object, "x", json_object_new_double(view.x));
++	json_object_object_add(view_object, "y", json_object_new_double(view.y));
++	json_object_object_add(view_object, "width",
++		json_object_new_double(view.width));
++	json_object_object_add(view_object, "height",
++		json_object_new_double(view.height));
++
++	json_object *object = json_object_new_object();
++	json_object_object_add(object, "factor",
++		json_object_new_double(output->zoom.factor));
++	json_object_object_add(object, "view", view_object);
++	json_object_object_add(object, "mouse_tracking", json_object_new_string(
++		zoom_mouse_tracking_to_string(config->zoom_mouse_tracking)));
++	json_object_object_add(object, "focus_tracking", json_object_new_string(
++		zoom_focus_tracking_to_string(config->zoom_focus_tracking)));
++	return object;
++}
++
+ json_object *ipc_json_describe_disabled_output(struct sway_output *output) {
+ 	struct wlr_output *wlr_output = output->wlr_output;
+ 
+diff --git a/sway/ipc-server.c b/sway/ipc-server.c
+--- a/sway/ipc-server.c
++++ b/sway/ipc-server.c
+@@ -694,6 +694,8 @@ void ipc_client_handle_command(struct ipc_client *client, uint32_t payload_lengt
+ 
+ 			const char *subpixel = sway_wl_output_subpixel_to_string(output->wlr_output->subpixel);
+ 			json_object_object_add(output_json, "subpixel_hinting", json_object_new_string(subpixel));
++			json_object_object_add(output_json, "zoom",
++				ipc_json_describe_output_zoom(output));
+ 			json_object_array_add(outputs, output_json);
+ 		}
+ 		struct sway_output *output;
+diff --git a/sway/meson.build b/sway/meson.build
+--- a/sway/meson.build
++++ b/sway/meson.build
+@@ -21,6 +21,7 @@ sway_sources = files(
+ 	'desktop/tearing.c',
+ 	'desktop/transaction.c',
+ 	'desktop/xdg_shell.c',
++	'desktop/zoom.c',
+ 	'desktop/launcher.c',
+ 
+ 	'input/input-manager.c',
+@@ -126,6 +127,9 @@ sway_sources = files(
+ 	'commands/workspace_layout.c',
+ 	'commands/ws_auto_back_and_forth.c',
+ 	'commands/xwayland.c',
++	'commands/zoom.c',
++	'commands/zoom_focus_tracking.c',
++	'commands/zoom_mouse_tracking.c',
+ 
+ 	'commands/bar/bind.c',
+ 	'commands/bar/binding_mode_indicator.c',
+@@ -216,6 +220,7 @@ sway_sources = files(
+ 	'commands/output/toggle.c',
+ 	'commands/output/transform.c',
+ 	'commands/output/unplug.c',
++	'commands/output/zoom.c',
+ 	'commands/output/color_profile.c',
+ 
+ 	'tree/arrange.c',
+diff --git a/sway/sway-ipc.7.scd b/sway/sway-ipc.7.scd
+--- a/sway/sway-ipc.7.scd
++++ b/sway/sway-ipc.7.scd
+@@ -244,6 +244,32 @@ following properties:
+ |- rect
+ :  object
+ :  The bounds for the output consisting of _x_, _y_, _width_, and _height_
++|- zoom
++:  object
++:  The enlargement of the output, for active outputs only. See below
++
++
++The _zoom_ object of an active output has the following properties:
++
++[- *PROPERTY*
++:- *DATA TYPE*
++:- *DESCRIPTION*
++|- factor
++:  float
++:[ The enlargement factor, from _1_ (not enlarged) to _32_
++|- view
++:  object
++:  The part of the layout shown on the output, consisting of _x_, _y_, _width_
++   and _height_ in layout coordinates. When the factor is _1_, this is the
++   output's _rect_
++|- mouse_tracking
++:  string
++:  How the view follows the pointer: _centered_, _proportional_, _push_ or
++   _none_. See *zoom_mouse_tracking* in *sway*(5)
++|- focus_tracking
++:  string
++:  How the view follows keyboard focus: _centered_, _push_ or _none_. See
++   *zoom_focus_tracking* in *sway*(5)
+ 
+ 
+ *Example Reply:*
+@@ -286,6 +312,17 @@ following properties:
+ 			"width": 1920,
+ 			"height": 1080,
+ 			"refresh": 60000
++		},
++		"zoom": {
++			"factor": 2.0,
++			"view": {
++				"x": 480.0,
++				"y": 270.0,
++				"width": 960.0,
++				"height": 540.0
++			},
++			"mouse_tracking": "proportional",
++			"focus_tracking": "none"
+ 		}
+ 	}
+ ]
+diff --git a/sway/sway-output.5.scd b/sway/sway-output.5.scd
+--- a/sway/sway-output.5.scd
++++ b/sway/sway-output.5.scd
+@@ -210,6 +210,22 @@ must be separated by one space. For example:
+ 
+ 	This setting only has effect when a window is fullscreen on the output.
+ 
++*output* <name> zoom <factor>|off
++	Enlarges everything shown on the output by _factor_, a decimal number
++	from 1 to 32. A factor of 1, or _off_, disables the enlargement, which
++	is the default.
++
++	The output then shows a rectangle of the layout that is _factor_ times
++	smaller than the output, including windows, layer surfaces and the
++	pointer. Windows, outputs and input coordinates are not changed, so
++	clients are not told about the enlargement. The shown rectangle follows
++	the pointer and the keyboard focus, see *zoom_mouse_tracking* and
++	*zoom_focus_tracking* in *sway*(5). The _zoom_ command in *sway*(5)
++	changes the factor of the output under the pointer.
++
++	Like other output settings, the factor is kept when the output is
++	disabled or disconnected.
++
+ # SEE ALSO
+ 
+ *sway*(5) *sway-input*(5)
+diff --git a/sway/sway.5.scd b/sway/sway.5.scd
+--- a/sway/sway.5.scd
++++ b/sway/sway.5.scd
+@@ -975,6 +975,50 @@ The default colors are:
+ 	switch to workspace 2, then invoke the *workspace 2* command again, you
+ 	will be returned to workspace 1. Default is _no_.
+ 
++*zoom* in [<step>]
++	Raises the enlargement factor of the output under the pointer by _step_,
++	a positive decimal number. The default step is 1. The factor does not go
++	above 32.
++
++*zoom* out [<step>]
++	Lowers the enlargement factor of the output under the pointer by _step_,
++	a positive decimal number. The default step is 1. The factor does not go
++	below 1.
++
++*zoom* set <factor>
++	Sets the enlargement factor of the output under the pointer, a decimal
++	number from 1 to 32. A factor of 1, or _off_, disables the enlargement.
++
++*zoom* off
++	Disables the enlargement of the output under the pointer.
++
++*zoom* toggle
++	Toggles the enlargement of the output under the pointer. Toggling an
++	enlarged output disables the enlargement; toggling an output that is not
++	enlarged restores the most recent factor above 1 it used, or 2.
++
++	Each _zoom_ command works like setting the factor of the output under
++	the pointer with *output* <name> zoom <factor> (see *sway-output*(5)).
++	An enlarged output shows a part of the layout, its _view_, enlarged to
++	fill the output, while windows, input and outputs keep their geometry.
++
++*zoom_focus_tracking* centered|push|none
++	Sets how the view of an enlarged output follows the keyboard focus when
++	a window is focused other than through the pointer, for example by a
++	command, a key binding, a workspace switch or a new window. Only the
++	output of the focused window moves its view. _centered_ centers the view
++	on the window. _push_ moves the view by the smallest amount that shows
++	the whole window, or shows its top-left corner when the window is bigger
++	than the view. _none_ leaves the view alone. Default is _none_.
++
++*zoom_mouse_tracking* centered|proportional|push|none
++	Sets how the view of an enlarged output follows the pointer when it moves
++	over that output. _proportional_ keeps the pointer at the same relative
++	position in the view as on the output. _centered_ keeps the pointer in
++	the middle of the view, except near the edges of the output. _push_ only
++	moves the view by the smallest amount that keeps the pointer inside it.
++	_none_ leaves the view alone. Default is _proportional_.
++
+ # CRITERIA
+ 
+ A criteria is a string in the form of, for example:
+diff --git a/sway/tree/output.c b/sway/tree/output.c
+--- a/sway/tree/output.c
++++ b/sway/tree/output.c
+@@ -135,6 +135,7 @@ struct sway_output *output_create(struct wlr_output *wlr_output) {
+ 	wlr_output->data = output;
+ 	output->detected_subpixel = wlr_output->subpixel;
+ 	output->scale_filter = SCALE_FILTER_NEAREST;
++	output->zoom.factor = 1;
+ 
+ 	wl_signal_init(&output->events.disable);
+ 
