@@ -1,0 +1,152 @@
+#!/bin/sh
+# 20-screen-magnifier: output zoom enlarges what an output shows, follows the
+# pointer and the keyboard focus, and changes no window or output geometry.
+set -eu
+. debian/tests/lib-headless.sh
+in_dbus_session "$@"
+setup_runtime
+
+cat > "$WORK/config" <<EOF
+xwayland disable
+default_border none
+focus_follows_mouse no
+mouse_warping none
+output HEADLESS-1 mode --custom 1280x800 position 0 0
+EOF
+start_sway "$WORK/config"
+for socket in "$XDG_RUNTIME_DIR"/wayland-*; do
+	case "$socket" in *.lock) continue ;; esac
+	export WAYLAND_DISPLAY="${socket##*/}"
+done
+
+cmd() {
+	swaymsg "$1" > /dev/null || fail "command failed: $1"
+}
+
+# expect NAME GOT WANT
+expect() {
+	echo "$1: $2"
+	[ "$2" = "$3" ] || fail "$1: expected $3"
+}
+
+# zoom: factor and view of HEADLESS-1, as "factor x y width height" (jq keeps
+# the 1.0 of the reply unless the number is computed on; seat cursor set goes
+# through a float, so round to hundredths)
+zoom() {
+	swaymsg -t get_outputs -r | jq -r '.[] | select(.name == "HEADLESS-1").zoom
+		| [.factor, .view.x, .view.y, .view.width, .view.height]
+		| map(. * 100 | round / 100 | tostring) | join(" ")'
+}
+
+# pixels X,Y...: colours of the given pixels of HEADLESS-1, as R,G,B
+pixels() {
+	grim -o HEADLESS-1 "$WORK/shot.png"
+	python3 - "$WORK/shot.png" "$@" <<-'EOF'
+	import sys
+	from PIL import Image
+	image = Image.open(sys.argv[1]).convert("RGB")
+	points = [tuple(map(int, p.split(","))) for p in sys.argv[2:]]
+	print(" ".join("%d,%d,%d" % image.getpixel(p) for p in points))
+	EOF
+}
+
+# Two windows side by side: l is red on the left half, r blue on the right.
+for name in l:ff0000 r:0000ff; do
+	foot --app-id "${name%:*}" -o "colors.background=${name#*:}" \
+		-o "colors.foreground=${name#*:}" -o cursor.color=${name#*:}\ ${name#*:} \
+		sleep infinity > /dev/null 2>&1 &
+	i=0
+	until swaymsg -t get_tree -r | jq -e --arg n "${name%:*}" \
+			'.. | objects | select(.app_id? == $n and .focused)' > /dev/null; do
+		i=$((i + 1))
+		[ "$i" -le 50 ] || fail "window ${name%:*} did not appear"
+		sleep 0.2
+	done
+done
+sleep 0.5
+
+rects() {
+	swaymsg -t get_tree -r | jq -c '[.. | objects | select(.app_id? != null)
+		| [.app_id, .rect.x, .rect.y, .rect.width, .rect.height]]'
+}
+RECTS=$(rects)
+expect "windows" "$RECTS" '[["l",0,0,640,800],["r",640,0,640,800]]'
+expect "default zoom" "$(zoom)" "1 0 0 1280 800"
+expect "default tracking" "$(swaymsg -t get_outputs -r | jq -r '.[0].zoom
+	| "\(.mouse_tracking) \(.focus_tracking)"')" "proportional none"
+expect "not enlarged" "$(pixels 320,400 960,400)" "255,0,0 0,0,255"
+
+# Pointer at the left edge: the view is the left half, around the pointer.
+cmd "seat - cursor set 0 400"
+cmd "zoom set 2"
+sleep 0.3
+expect "zoom set 2 at the left edge" "$(zoom)" "2 0 200 640 400"
+expect "left half enlarged" "$(pixels 80,400 640,400 1200,400)" \
+	"255,0,0 255,0,0 255,0,0"
+expect "window geometry while enlarged" "$(rects)" "$RECTS"
+
+# Proportional tracking: the right edge of the output shows its right edge.
+cmd "seat - cursor set 1279 400"
+sleep 0.3
+expect "pointer at the right edge" "$(zoom)" "2 639.5 200 640 400"
+expect "right half enlarged" "$(pixels 80,400 1200,400)" "0,0,255 0,0,255"
+
+# A refused command changes nothing.
+for bad in "zoom set 40" "zoom in 0" "zoom set nan" "output * zoom 0.5" \
+		"zoom_mouse_tracking follow"; do
+	swaymsg "$bad" > /dev/null 2>&1 && fail "'$bad' was accepted"
+done
+expect "after refused commands" "$(zoom)" "2 639.5 200 640 400"
+
+# Off, and toggle back to the last factor.
+cmd "zoom off"
+sleep 0.3
+expect "zoom off" "$(zoom)" "1 0 0 1280 800"
+expect "not enlarged again" "$(pixels 320,400 960,400)" "255,0,0 0,0,255"
+cmd "zoom toggle"
+expect "zoom toggle restores 2" "$(zoom | cut -d' ' -f1)" "2"
+cmd "zoom in 0.5"
+expect "zoom in 0.5" "$(zoom | cut -d' ' -f1)" "2.5"
+cmd "zoom out 5"
+expect "zoom out stops at 1" "$(zoom | cut -d' ' -f1)" "1"
+cmd "zoom toggle"
+expect "zoom toggle restores 2.5" "$(zoom | cut -d' ' -f1)" "2.5"
+cmd "output HEADLESS-1 zoom 2"
+
+# Focus tracking: focusing l by command centres the view on it; the pointer
+# stays where it is.
+cmd "zoom_focus_tracking centered"
+cmd "seat - cursor set 1279 400"
+cmd '[app_id="^l$"] focus'
+sleep 0.3
+expect "focus centred on l" "$(zoom)" "2 0 200 640 400"
+expect "l shown" "$(pixels 640,400)" "255,0,0"
+# The next pointer motion follows the pointer again, still at the right edge.
+cmd "seat - cursor move 0 0"
+expect "pointer motion after the focus move" "$(zoom)" "2 639.5 200 640 400"
+cmd "focus right"
+expect "focus centred on r" "$(zoom)" "2 640 200 640 400"
+cmd '[app_id="^l$"] focus'
+expect "focus centred on l again" "$(zoom)" "2 0 200 640 400"
+
+# Push tracking for the pointer: the view moves only to keep it inside.
+cmd "zoom_mouse_tracking push"
+cmd "seat - cursor set 400 400"
+expect "push, pointer inside" "$(zoom)" "2 0 200 640 400"
+cmd "seat - cursor set 700 700"
+expect "push, pointer right and below" "$(zoom)" "2 60 300 640 400"
+
+# Reload: the tracking modes come from the file again, and a bare zoom line
+# in it acts on the current factor each time.
+echo "zoom in" >> "$WORK/config"
+cmd "reload"
+sleep 0.3
+expect "reload with 'zoom in'" "$(zoom | cut -d' ' -f1)" "3"
+expect "tracking after reload" "$(swaymsg -t get_outputs -r | jq -r '.[0].zoom
+	| "\(.mouse_tracking) \(.focus_tracking)"')" "proportional none"
+cmd "reload"
+sleep 0.3
+expect "second reload" "$(zoom | cut -d' ' -f1)" "4"
+expect "window geometry after all" "$(rects)" "$RECTS"
+
+echo "PASS: screen-magnifier"
