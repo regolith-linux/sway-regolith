@@ -1,0 +1,161 @@
+#!/bin/sh
+# 22-mouse-warping-output-parity: with mouse_warping output, the pointer
+# follows the focus to another output at the end of a command, and stays
+# where it is when a window opens or closes or when a command ends on the
+# output it started on, as in i3 4.25.1. mouse_warping container and none
+# behave as before.
+#
+# The pointer position is read back with a small floating window that is
+# never focused: "move position cursor" centres it on the pointer.
+set -eu
+. debian/tests/lib-headless.sh
+in_dbus_session "$@"
+setup_runtime
+
+# new_session MODE: restart headless sway with fresh state, two 800x600
+# outputs side by side (workspace L left, R right) and mouse_warping MODE.
+new_session() {
+	if [ -n "${SWAY_PID:-}" ]; then
+		kill "$SWAY_PID" 2>/dev/null || true
+		wait "$SWAY_PID" 2>/dev/null || true
+	fi
+	SESSION=$((${SESSION:-0} + 1))
+	export XDG_RUNTIME_DIR="$WORK/run-$SESSION"
+	mkdir -m 700 "$XDG_RUNTIME_DIR"
+	export WLR_HEADLESS_OUTPUTS=2
+	unset SWAYSOCK WAYLAND_DISPLAY
+	cat > "$WORK/config" <<-EOF
+	xwayland disable
+	default_border none
+	default_floating_border none
+	focus_follows_mouse no
+	mouse_warping $1
+	output HEADLESS-1 mode --custom 800x600 position 0 0
+	output HEADLESS-2 mode --custom 800x600 position 800 0
+	workspace L output HEADLESS-1
+	workspace R output HEADLESS-2
+	no_focus [app_id="^probe$"]
+	for_window [app_id="^probe$"] floating enable, resize set 40 40
+	EOF
+	start_sway "$WORK/config"
+	for socket in "$XDG_RUNTIME_DIR"/wayland-*; do
+		case "$socket" in *.lock) continue ;; esac
+		export WAYLAND_DISPLAY="${socket##*/}"
+	done
+	cmd "workspace L"
+	start_window probe
+	wait_for "probe" '.. | objects | select(.app_id? == "probe" and .type == "floating_con")'
+}
+
+cmd() {
+	swaymsg "$1" > /dev/null || fail "command failed: $1"
+}
+
+# start_window NAME: start a foot window whose app_id is NAME. Sizing by cells
+# is off so that the probe keeps the exact size it is given.
+start_window() {
+	foot -o resize-by-cells=no --app-id "$1" sh -c 'exec sleep infinity' \
+		> /dev/null 2>&1 &
+}
+
+# wait_for WHAT JQ: wait until the tree matches JQ.
+wait_for() {
+	i=0
+	until swaymsg -t get_tree -r | jq -e "$2" > /dev/null; do
+		i=$((i + 1))
+		[ "$i" -le 50 ] || fail "$1 did not happen"
+		sleep 0.2
+	done
+}
+
+# open NAME [WORKSPACE]: open a window (on WORKSPACE) and wait until it is
+# focused.
+open() {
+	[ -z "${2:-}" ] || cmd "workspace $2"
+	start_window "$1"
+	wait_for "window $1" ".. | objects | select(.app_id? == \"$1\" and .focused)"
+}
+
+# point X Y: put the pointer at X,Y.
+point() {
+	cmd "seat seat0 cursor set $1 $2"
+}
+
+# pointer: print the pointer position as "X Y". The probe's position is
+# reported in whole pixels, rounded down, so with an odd size its middle is
+# half a pixel short of the pointer.
+pointer() {
+	cmd "[app_id=\"^probe\$\"] move position cursor"
+	sleep 0.2
+	swaymsg -t get_tree -r | jq -r '.. | objects | select(.app_id? == "probe")
+		| "\(.rect.x + .rect.width / 2 | ceil) \(.rect.y + .rect.height / 2 | ceil)"'
+}
+
+# expect NAME WANT: the pointer is at WANT ("X Y").
+expect() {
+	got=$(pointer)
+	echo "$1: pointer at $got"
+	[ "$got" = "$2" ] || fail "$1: expected the pointer at $2"
+}
+
+focused() {
+	swaymsg -t get_tree -r | jq -r 'first(.. | objects | select(.focused? == true))
+		| if .app_id then .app_id else .type + " " + .name end'
+}
+
+new_session output
+open a L
+open b R
+cmd "[app_id=\"^a\$\"] focus"
+
+# A window opening or closing on the focused output leaves the pointer alone.
+point 1500 50
+open c
+expect open-window "1500 50"
+cmd "[app_id=\"^c\$\"] kill"
+wait_for "c closing" '[.. | objects | select(.app_id? == "c")] | length == 0'
+expect close-window "1500 50"
+
+# A command that ends on the output it started on leaves the pointer alone.
+cmd "[app_id=\"^a\$\"] focus"
+point 50 50
+cmd "focus output right; focus output left"
+expect focus-there-and-back "50 50"
+
+# Focus moving to the other output takes the pointer to the focused window...
+cmd "focus output right"
+[ "$(focused)" = b ] || fail "focus-output: b is not focused"
+expect focus-output "1200 300"
+
+# ...unless the pointer is already on that output.
+cmd "focus output left"
+point 1500 50
+cmd "focus output right"
+expect pointer-already-there "1500 50"
+
+# Moving the focused window onto the other output takes the pointer along.
+cmd "[app_id=\"^a\$\"] focus"
+point 50 50
+cmd "move right"
+[ "$(focused)" = a ] || fail "move-right: a is not focused"
+expect move-right "1000 300"
+
+# mouse_warping container still warps to a window that opens.
+new_session container
+open a L
+open b R
+cmd "[app_id=\"^a\$\"] focus"
+point 1500 50
+open c
+expect container-open-window "600 300"
+
+# mouse_warping none never moves the pointer.
+new_session none
+open a L
+open b R
+cmd "[app_id=\"^a\$\"] focus"
+point 50 50
+cmd "focus output right"
+expect none-focus-output "50 50"
+
+echo "PASS: mouse-warping-output"
