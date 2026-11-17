@@ -1,0 +1,973 @@
+Description: Read exec and exec_always quoting like i3
+ sway read the quotes and backslashes in a launch command differently
+ depending on where it came from: a config line at startup kept every
+ backslash, the same line on reload went through C-style unescaping,
+ IPC only stripped quotes, and bindings were unescaped at load and
+ quote-stripped when they fired. None of these matched i3, so a config
+ shared between the two sessions, or a launcher that hands sway a
+ desktop entry's command, could not start a program whose path has a
+ space (exec "\"/opt/My App/run\"" works in i3 only), and the same line
+ could give a program different arguments before and after a reload.
+ .
+ Launch commands now read their argument the way i3 does. Config lines,
+ at startup and on reload alike: a double-quoted argument ends at the
+ next " without a backslash in front of it, text after it is a config
+ error (the command still runs), anything else is the rest of the line;
+ only \" is unescaped. Runtime commands (IPC, and bindings and for_window
+ rules when they fire): a backslash takes the next character inside
+ double quotes, only blanks may follow the closing quote, an unquoted
+ argument ends at the first ; , or line break outside quotes, and \" and
+ \\ are unescaped. Bindings and rules store their launch commands after
+ the config reading, so they get the runtime reading when they fire. An
+ empty quoted argument is an error. sway's single-quote extension stays:
+ an argument that is exactly one single-quoted string runs without those
+ quotes. Every other command is parsed as before.
+ .
+ unescape_string() no longer reads past a trailing backslash, which it
+ did for any config line whose last argument ended in one (a heap
+ over-read that the binding storage could otherwise reach more often).
+ .
+ Regolith-only part: with 08-variable-command-name, a variable that holds
+ exec or exec_always at the start of a runtime command gets the same
+ launch reading.
+Author: rego-port-bot <339843353+rego-port-bot@users.noreply.github.com>
+Bug: https://github.com/swaywm/sway/issues/5931
+Forwarded: no
+Last-Update: 2026-11-16
+---
+diff --git a/common/stringop.c b/common/stringop.c
+--- a/common/stringop.c
++++ b/common/stringop.c
+@@ -154,7 +154,8 @@ int unescape_string(char *string) {
+ 	int len = strlen(string);
+ 	int i;
+ 	for (i = 0; string[i]; ++i) {
+-		if (string[i] == '\\') {
++		// A backslash at the end of the string is kept as it is
++		if (string[i] == '\\' && string[i + 1]) {
+ 			switch (string[++i]) {
+ 			case '0':
+ 				string[i - 1] = '\0';
+diff --git a/include/sway/commands.h b/include/sway/commands.h
+--- a/include/sway/commands.h
++++ b/include/sway/commands.h
+@@ -59,6 +59,20 @@ const struct cmd_handler *find_handler(const char *line,
+  */
+ list_t *execute_command(char *command,  struct sway_seat *seat,
+ 		struct sway_container *con);
++/**
++ * Parse and executes a command received over IPC, of the given length.
++ *
++ * Line breaks separate commands like semicolons, except inside quotes in the
++ * argument of a launch command (exec or exec_always), which is read as sent.
++ */
++list_t *execute_ipc_command(const char *payload, size_t length);
++/**
++ * Executes a config command that was deferred until sway is running.
++ *
++ * Launch commands get the same reading as config commands run on reload; other
++ * commands are executed with execute_command.
++ */
++list_t *execute_deferred_command(char *line);
+ /**
+  * Parse and handles a command during config file loading.
+  *
+diff --git a/sway/commands.c b/sway/commands.c
+--- a/sway/commands.c
++++ b/sway/commands.c
+@@ -203,8 +203,370 @@ static void set_config_node(struct sway_node *node, bool node_overridden) {
+ 	}
+ }
+ 
+-list_t *execute_command(char *_exec, struct sway_seat *seat,
+-		struct sway_container *con) {
++/*
++ * Launch commands (exec and exec_always) read the quotes and backslashes in
++ * their argument the way i3 does, with two readings: one for config file
++ * lines, and one for commands run at runtime (over IPC, or stored by a binding
++ * or window rule and run when it fires).
++ */
++
++static const char whitespace[] = " \f\n\r\t\v";
++static const char launch_blanks[] = " \t";
++// Characters that end the name of a launch command, or its option
++static const char launch_word_ends[] = " \f\n\r\t\v;,";
++// Separators that end a launch command at runtime
++static const char launch_separators[] = ";,\n";
++
++struct launch_args {
++	char *name; // exec or exec_always, as written
++	bool no_startup_id;
++	char *command; // the command handed to the shell; NULL if there is none
++	bool empty; // the argument is an empty pair of double quotes
++	char *tail; // text after the closing double quote of the argument
++};
++
++static void launch_args_finish(struct launch_args *args) {
++	free(args->name);
++	free(args->command);
++	free(args->tail);
++}
++
++/**
++ * Returns whether the len bytes at name are the name of a launch command.
++ */
++static bool is_launch_name_n(const char *name, size_t len) {
++	return (len == strlen("exec") && strncasecmp(name, "exec", len) == 0)
++		|| (len == strlen("exec_always")
++			&& strncasecmp(name, "exec_always", len) == 0);
++}
++
++static bool is_launch_name(const char *name) {
++	return is_launch_name_n(name, strlen(name));
++}
++
++/**
++ * Returns the length of the launch command name that str starts with, or 0 if
++ * str does not start with one.
++ */
++static size_t launch_name_length(const char *str) {
++	size_t len = strcspn(str, launch_word_ends);
++	return is_launch_name_n(str, len) ? len : 0;
++}
++
++/**
++ * Skips the blanks after the name of a launch command, and an optional
++ * --no-startup-id followed by blanks. Returns the start of the argument.
++ */
++static const char *launch_argument(const char *str, bool *no_startup_id) {
++	static const char option[] = "--no-startup-id";
++	str += strspn(str, launch_blanks);
++	*no_startup_id = has_prefix(str, option)
++		&& strchr(launch_word_ends, str[strlen(option)]);
++	if (*no_startup_id) {
++		str += strlen(option);
++		str += strspn(str, launch_blanks);
++	}
++	return str;
++}
++
++/**
++ * Returns whether the len bytes at str are exactly one single-quoted stretch.
++ */
++static bool is_single_quoted(const char *str, size_t len) {
++	return len >= 2 && str[0] == '\''
++		&& memchr(str + 1, '\'', len - 1) == str + len - 1;
++}
++
++/**
++ * Copies len bytes of str, removing a backslash directly in front of a double
++ * quote and, with fold_pairs, one backslash of each pair. Every other
++ * backslash is kept.
++ */
++static char *launch_unescape(const char *str, size_t len, bool fold_pairs) {
++	char *res = malloc(len + 1);
++	if (!res) {
++		return NULL;
++	}
++	size_t n = 0;
++	for (size_t i = 0; i < len; ++i) {
++		if (str[i] == '\\' && i + 1 < len && (str[i + 1] == '"'
++					|| (fold_pairs && str[i + 1] == '\\'))) {
++			++i;
++		}
++		res[n++] = str[i];
++	}
++	res[n] = '\0';
++	return res;
++}
++
++/**
++ * Returns the first character of str that is one of delims and is not inside
++ * quotes, or the end of str. Quotes and backslashes are tracked like argsep()
++ * does.
++ */
++static const char *find_separator(const char *str, const char *delims) {
++	bool in_string = false;
++	bool in_char = false;
++	bool escaped = false;
++	for (; *str; ++str) {
++		if (*str != '"' && *str != '\'' && *str != '\\'
++				&& !strchr(delims, *str)) {
++			escaped = false;
++		} else if (*str == '"' && !in_char && !escaped) {
++			in_string = !in_string;
++		} else if (*str == '\'' && !in_string && !escaped) {
++			in_char = !in_char;
++		} else if (*str == '\\') {
++			escaped = !escaped;
++		} else if (!in_string && !in_char && !escaped) {
++			break;
++		}
++	}
++	return str;
++}
++
++/**
++ * Returns the closing double quote of the argument starting at str, or the end
++ * of str, using the config reading: the argument ends at the next double quote
++ * that does not have a backslash directly in front of it.
++ */
++static const char *config_quote_end(const char *str) {
++	const char *end = str + 1;
++	while (*end && (*end != '"' || end[-1] == '\\')) {
++		++end;
++	}
++	return end;
++}
++
++/**
++ * Returns the closing double quote of the argument starting at str, or the end
++ * of str, using the runtime reading: a backslash always takes the next
++ * character along with it.
++ */
++static const char *runtime_quote_end(const char *str) {
++	const char *end = str + 1;
++	while (*end && *end != '"') {
++		if (*end == '\\' && end[1]) {
++			++end;
++		}
++		++end;
++	}
++	return end;
++}
++
++/**
++ * Reads arg, the argument of a launch command, into args. With runtime set,
++ * this is the runtime reading, otherwise the config reading. Both handle a
++ * double-quoted argument and an argument that is exactly one single-quoted
++ * stretch; anything else is the command as it is, minus its escapes.
++ */
++static void read_launch_argument(struct launch_args *args, const char *arg,
++		bool runtime) {
++	size_t len = strlen(arg);
++	if (len == 0) {
++		return;
++	}
++	if (*arg == '"') {
++		const char *end = runtime ? runtime_quote_end(arg) : config_quote_end(arg);
++		if (end == arg + 1) {
++			args->empty = true;
++			return;
++		}
++		if (*end) {
++			const char *tail = end + 1 + strspn(end + 1, launch_blanks);
++			if (*tail) {
++				args->tail = strdup(tail);
++			}
++		}
++		args->command = launch_unescape(arg + 1, end - arg - 1, runtime);
++		return;
++	}
++	size_t trimmed = len;
++	while (trimmed > 0 && strchr(launch_blanks, arg[trimmed - 1])) {
++		--trimmed;
++	}
++	if (is_single_quoted(arg, trimmed)) {
++		args->command = strndup(arg + 1, trimmed - 2);
++	} else {
++		args->command = launch_unescape(arg, len, runtime);
++	}
++}
++
++/**
++ * Reads a launch command written in a config file. line starts with the name
++ * of the command and runs to the end of the line, and has had its variables
++ * replaced.
++ */
++static void read_config_launch(struct launch_args *args, const char *line) {
++	line += strspn(line, whitespace);
++	size_t name_len = strcspn(line, whitespace);
++	args->name = strndup(line, name_len);
++	read_launch_argument(args,
++		launch_argument(line + name_len, &args->no_startup_id), false);
++}
++
++/**
++ * Reads a launch command at runtime. *stringp points at the name of the
++ * command; afterwards it points past the separator that ends the command, or
++ * is NULL if nothing follows. *matched is set to that separator, with a line
++ * break counting as a semicolon. Variables are replaced in the argument before
++ * it is read.
++ */
++static void read_runtime_launch(struct launch_args *args, const char **stringp,
++		char *matched) {
++	const char *start = *stringp;
++	size_t name_len = launch_name_length(start);
++	args->name = strndup(start, name_len);
++	const char *arg = launch_argument(start + name_len, &args->no_startup_id);
++
++	const char *arg_end, *end;
++	if (*arg == '"') {
++		arg_end = runtime_quote_end(arg);
++		if (*arg_end) {
++			++arg_end;
++		}
++		end = arg_end + strspn(arg_end, launch_blanks);
++		if (*end && !strchr(launch_separators, *end)) {
++			// Only blanks may follow the closing quote
++			args->tail = strndup(end, find_separator(end, launch_separators) - end);
++			*stringp = NULL;
++			*matched = '\0';
++		}
++	} else {
++		arg_end = end = find_separator(arg, launch_separators);
++	}
++	if (!args->tail) {
++		*stringp = *end ? end + 1 : NULL;
++		*matched = *end == '\n' ? ';' : *end;
++	}
++
++	char *text = do_var_replacement(strndup(arg, arg_end - arg));
++	if (text) {
++		char *tail = args->tail;
++		args->tail = NULL;
++		read_launch_argument(args, text, true);
++		if (tail) {
++			free(args->tail);
++			args->tail = tail;
++		}
++		free(text);
++	}
++}
++
++/**
++ * Returns the arguments for the handler of a launch command: its name, the
++ * --no-startup-id option if given, and the command.
++ */
++static char **launch_argv(const struct launch_args *args, int *argc) {
++	char **argv = calloc(4, sizeof(char *));
++	if (!argv) {
++		*argc = 0;
++		return NULL;
++	}
++	*argc = 0;
++	argv[(*argc)++] = strdup(args->name);
++	// The option only goes along with a command, so that a command that is
++	// itself "--no-startup-id" is not taken for the option
++	if (args->command) {
++		if (args->no_startup_id) {
++			argv[(*argc)++] = strdup("--no-startup-id");
++		}
++		argv[(*argc)++] = strdup(args->command);
++	}
++	return argv;
++}
++
++static struct cmd_results *launch_empty_error(const struct launch_args *args) {
++	return cmd_results_new(CMD_INVALID,
++			"Invalid %s command (the quoted command is empty)", args->name);
++}
++
++static struct cmd_results *launch_tail_error(const struct launch_args *args,
++		enum cmd_status status) {
++	return cmd_results_new(status, "Invalid %s command (expected only "
++			"blanks after the closing quote, got '%s')", args->name, args->tail);
++}
++
++/**
++ * Prepares the commands stored by a binding or window rule in a config file,
++ * starting at its first launch command. Launch arguments get the config
++ * reading, but keep their quotes so that they get the runtime reading when the
++ * binding or rule fires; other commands are unescaped as before.
++ */
++static char *store_commands(const char *text) {
++	char *res = calloc(strlen(text) + 1, 1);
++	if (!res) {
++		return NULL;
++	}
++	char *out = res;
++	while (true) {
++		size_t blanks = strspn(text, whitespace);
++		memcpy(out, text, blanks);
++		out += blanks;
++		text += blanks;
++
++		const char *end;
++		size_t name_len = launch_name_length(text);
++		if (name_len) {
++			bool no_startup_id;
++			const char *arg = launch_argument(text + name_len, &no_startup_id);
++			memcpy(out, text, arg - text);
++			out += arg - text;
++			if (*arg == '"') {
++				const char *close = config_quote_end(arg);
++				end = find_separator(*close ? close + 1 : close, ";,");
++			} else {
++				end = find_separator(arg, ";,");
++			}
++			size_t trimmed = end - arg;
++			while (trimmed > 0 && strchr(launch_blanks, arg[trimmed - 1])) {
++				--trimmed;
++			}
++			if (is_single_quoted(arg, trimmed)) {
++				memcpy(out, arg, end - arg);
++				out += end - arg;
++			} else {
++				char *unescaped = launch_unescape(arg, end - arg, false);
++				if (unescaped) {
++					out = stpcpy(out, unescaped);
++					free(unescaped);
++				}
++			}
++		} else {
++			end = find_separator(text, ";,");
++			char *command = strndup(text, end - text);
++			int argc = 0;
++			char **argv = command ? split_args(command, &argc) : NULL;
++			for (int i = 0; i < argc; ++i) {
++				unescape_string(argv[i]);
++			}
++			if (argc) {
++				char *joined = join_args(argv, argc);
++				out = stpcpy(out, joined);
++				free(joined);
++			}
++			if (argv) {
++				free_argv(argc, argv);
++			}
++			free(command);
++		}
++
++		if (!*end) {
++			break;
++		}
++		*out++ = *end;
++		text = end + 1;
++	}
++	*out = '\0';
++	return res;
++}
++
++/**
++ * Executes the commands in exec. sent is the text as it was received, of the
++ * same length as exec: launch commands read their arguments from it.
++ */
++static list_t *execute_commands(char *exec, const char *sent,
++		struct sway_seat *seat, struct sway_container *con) {
+ 	char *cmd;
+ 	char matched_delim = ';';
+ 	list_t *containers = NULL;
+@@ -218,11 +580,10 @@ list_t *execute_command(char *_exec, struct sway_seat *seat,
+ 		}
+ 	}
+ 
+-	char *exec = strdup(_exec);
+ 	char *head = exec;
+ 	list_t *res_list = create_list();
+ 
+-	if (!res_list || !exec) {
++	if (!res_list) {
+ 		return NULL;
+ 	}
+ 
+@@ -251,36 +612,89 @@ list_t *execute_command(char *_exec, struct sway_seat *seat,
+ 				for (; isspace(*head); ++head) {}
+ 			}
+ 		}
+-		// Split command list
+-		cmd = argsep(&head, ";,", &matched_delim);
+-		for (; isspace(*cmd); ++cmd) {}
+-
+-		if (strcmp(cmd, "") == 0) {
+-			sway_log(SWAY_INFO, "Ignoring empty command.");
+-			continue;
+-		}
+-		sway_log(SWAY_INFO, "Handling command '%s'", cmd);
+-		//TODO better handling of argv
+ 		int argc;
+-		char **argv = split_args(cmd, &argc);
+-		// Make sure the command is not stored in a variable
+-		if (*argv[0] == '$') {
+-			argv[0] = do_var_replacement(argv[0]);
+-			char *temp = join_args(argv, argc);
+-			free_argv(argc, argv);
+-			argv = split_args(temp, &argc);
+-			free(temp);
+-			if (!argc) {
+-				free_argv(argc, argv);
+-				continue;
++		char **argv;
++		size_t offset = head - exec;
++		bool launch = launch_name_length(head) > 0;
++		// 08-variable-command-name: a variable may hold the name of a launch
++		// command, which then reads its argument like any launch command
++		char *resolved = NULL;
++		size_t var_len = 0, name_len = 0;
++		if (!launch && *head == '$') {
++			var_len = strcspn(head, launch_word_ends);
++			char *name = do_var_replacement(strndup(head, var_len));
++			if (name && launch_name_length(name) > 0) {
++				const char *rest = sent + offset + var_len;
++				name_len = strlen(name);
++				resolved = malloc(name_len + strlen(rest) + 1);
++				if (resolved) {
++					memcpy(resolved, name, name_len);
++					strcpy(resolved + name_len, rest);
++					launch = true;
++				}
+ 			}
++			free(name);
+ 		}
+-		if (strcmp(argv[0], "exec") != 0 &&
+-				strcmp(argv[0], "exec_always") != 0 &&
+-				strcmp(argv[0], "mode") != 0) {
+-			for (int i = 1; i < argc; ++i) {
+-				if (*argv[i] == '\"' || *argv[i] == '\'') {
+-					strip_quotes(argv[i]);
++		struct launch_args launch_args = {0};
++		if (launch) {
++			// Launch commands are split off by their own reading, from the
++			// text as it was received
++			const char *start = resolved ? resolved : sent + offset;
++			const char *text = start;
++			read_runtime_launch(&launch_args, &text, &matched_delim);
++			if (text) {
++				size_t consumed = text - start;
++				if (resolved) {
++					// Map back from the replaced name to the variable
++					consumed = consumed > name_len
++						? consumed - name_len + var_len : var_len;
++				}
++				head = exec + offset + consumed;
++			} else {
++				head = NULL;
++			}
++			free(resolved);
++			sway_log(SWAY_INFO, "Handling launch command '%s' with '%s'",
++					launch_args.name, launch_args.command ? launch_args.command : "");
++			if (launch_args.empty) {
++				list_add(res_list, launch_empty_error(&launch_args));
++				launch_args_finish(&launch_args);
++				goto cleanup;
++			}
++			argv = launch_argv(&launch_args, &argc);
++			if (!argv) {
++				launch_args_finish(&launch_args);
++				goto cleanup;
++			}
++		} else {
++			// Split command list
++			cmd = argsep(&head, ";,", &matched_delim);
++			for (; isspace(*cmd); ++cmd) {}
++
++			if (strcmp(cmd, "") == 0) {
++				sway_log(SWAY_INFO, "Ignoring empty command.");
++				continue;
++			}
++			sway_log(SWAY_INFO, "Handling command '%s'", cmd);
++			//TODO better handling of argv
++			argv = split_args(cmd, &argc);
++			// Make sure the command is not stored in a variable
++			if (*argv[0] == '$') {
++				argv[0] = do_var_replacement(argv[0]);
++				char *temp = join_args(argv, argc);
++				free_argv(argc, argv);
++				argv = split_args(temp, &argc);
++				free(temp);
++				if (!argc) {
++					free_argv(argc, argv);
++					continue;
++				}
++			}
++			if (strcmp(argv[0], "mode") != 0) {
++				for (int i = 1; i < argc; ++i) {
++					if (*argv[i] == '\"' || *argv[i] == '\'') {
++						strip_quotes(argv[i]);
++					}
+ 				}
+ 			}
+ 		}
+@@ -289,11 +703,15 @@ list_t *execute_command(char *_exec, struct sway_seat *seat,
+ 			list_add(res_list, cmd_results_new(CMD_INVALID,
+ 					"Unknown/invalid command '%s'", argv[0]));
+ 			free_argv(argc, argv);
++			launch_args_finish(&launch_args);
+ 			goto cleanup;
+ 		}
+ 
+-		// Var replacement, for all but first argument of set and xresource
+-		for (int i = handler->handle == cmd_set || handler->handle == cmd_set_from_resource ? 2 : 1; i < argc; ++i) {
++		// Var replacement, for all but first argument of set and xresource.
++		// Launch commands have had theirs replaced before their argument was
++		// read.
++		for (int i = handler->handle == cmd_set || handler->handle == cmd_set_from_resource ? 2 : 1;
++				!launch && i < argc; ++i) {
+ 			argv[i] = do_var_replacement(argv[i]);
+ 		}
+ 
+@@ -309,6 +727,7 @@ list_t *execute_command(char *_exec, struct sway_seat *seat,
+ 			list_add(res_list, res);
+ 			if (res->status == CMD_INVALID) {
+ 				free_argv(argc, argv);
++				launch_args_finish(&launch_args);
+ 				goto cleanup;
+ 			}
+ 		} else if (containers->length == 0) {
+@@ -331,6 +750,7 @@ list_t *execute_command(char *_exec, struct sway_seat *seat,
+ 					if (res->status == CMD_INVALID) {
+ 						list_add(res_list, fail_res);
+ 						free_argv(argc, argv);
++						launch_args_finish(&launch_args);
+ 						goto cleanup;
+ 					}
+ 				}
+@@ -339,13 +759,86 @@ list_t *execute_command(char *_exec, struct sway_seat *seat,
+ 					fail_res ? fail_res : cmd_results_new(CMD_SUCCESS, NULL));
+ 		}
+ 		free_argv(argc, argv);
++		if (launch_args.tail) {
++			// The launch command has run, but nothing after it does
++			list_add(res_list, launch_tail_error(&launch_args, CMD_INVALID));
++			launch_args_finish(&launch_args);
++			goto cleanup;
++		}
++		launch_args_finish(&launch_args);
+ 	} while(head);
+ cleanup:
+-	free(exec);
+ 	list_free(containers);
+ 	return res_list;
+ }
+ 
++list_t *execute_command(char *_exec, struct sway_seat *seat,
++		struct sway_container *con) {
++	char *exec = strdup(_exec);
++	if (!exec) {
++		return NULL;
++	}
++	list_t *res_list = execute_commands(exec, exec, seat, con);
++	free(exec);
++	return res_list;
++}
++
++list_t *execute_ipc_command(const char *payload, size_t length) {
++	char *exec = malloc(length + 1);
++	char *sent = malloc(length + 1);
++	if (!exec || !sent) {
++		free(exec);
++		free(sent);
++		return NULL;
++	}
++	memcpy(exec, payload, length);
++	exec[length] = '\0';
++	memcpy(sent, exec, length + 1);
++
++	// Line breaks separate commands like semicolons. Launch commands read
++	// their arguments from the message as sent, where a line break inside
++	// quotes is kept.
++	char *line = strtok(exec, "\n");
++	while (line) {
++		size_t line_length = strlen(line);
++		if (line + line_length >= exec + length) {
++			break;
++		}
++		line[line_length] = ';';
++		line = strtok(NULL, "\n");
++	}
++
++	list_t *res_list = execute_commands(exec, sent, NULL, NULL);
++	free(exec);
++	free(sent);
++	return res_list;
++}
++
++list_t *execute_deferred_command(char *line) {
++	// Launch lines get the config reading, as they do on reload
++	bool launch = false;
++	int argc;
++	char **argv = split_args(line, &argc);
++	if (argc) {
++		char *name = do_var_replacement(strdup(argv[0]));
++		launch = name && launch_name_length(name) > 0;
++		free(name);
++	}
++	free_argv(argc, argv);
++	if (!launch) {
++		return execute_command(line, NULL, NULL);
++	}
++
++	list_t *res_list = create_list();
++	if (!res_list) {
++		return NULL;
++	}
++	char *new_block = NULL;
++	list_add(res_list, config_command(line, &new_block));
++	free(new_block);
++	return res_list;
++}
++
+ // this is like execute_command above, except:
+ // 1) it ignores empty commands (empty lines)
+ // 2) it does variable substitution
+@@ -355,6 +848,8 @@ cleanup:
+ // some state handled outside (notably the block mode, in read_config)
+ struct cmd_results *config_command(char *exec, char **new_block) {
+ 	struct cmd_results *results = NULL;
++	char *line = exec;
++	char *joined_line = NULL;
+ 	int argc;
+ 	char **argv = split_args(exec, &argc);
+ 
+@@ -380,10 +875,9 @@ struct cmd_results *config_command(char *exec, char **new_block) {
+ 	// Make sure the command is not stored in a variable
+ 	if (*argv[0] == '$') {
+ 		argv[0] = do_var_replacement(argv[0]);
+-		char *temp = join_args(argv, argc);
++		line = joined_line = join_args(argv, argc);
+ 		free_argv(argc, argv);
+-		argv = split_args(temp, &argc);
+-		free(temp);
++		argv = split_args(line, &argc);
+ 		if (!argc) {
+ 			results = cmd_results_new(CMD_SUCCESS, NULL);
+ 			goto cleanup;
+@@ -404,6 +898,17 @@ struct cmd_results *config_command(char *exec, char **new_block) {
+ 		goto cleanup;
+ 	}
+ 
++	// Launch commands, and the commands stored by bindings and window rules,
++	// are read from the line as written, after variable replacement
++	bool launch = handler->handle == cmd_exec
++		|| handler->handle == cmd_exec_always;
++	bool stores_commands = handler->handle == cmd_bindsym
++		|| handler->handle == cmd_bindcode
++		|| handler->handle == cmd_bindswitch
++		|| handler->handle == cmd_bindgesture
++		|| handler->handle == cmd_for_window
++		|| handler->handle == cmd_mode;
++
+ 	// Do variable replacement
+ 	if ((handler->handle == cmd_set || handler->handle == cmd_set_from_resource )&& argc > 1 && *argv[1] == '$') {
+ 		// Escape the variable name so it does not get replaced by one shorter
+@@ -413,14 +918,74 @@ struct cmd_results *config_command(char *exec, char **new_block) {
+ 		free(argv[1]);
+ 		argv[1] = temp;
+ 	}
+-	char *command = do_var_replacement(join_args(argv, argc));
++	char *command = do_var_replacement(launch || stores_commands
++			? strdup(line) : join_args(argv, argc));
+ 	sway_log(SWAY_INFO, "After replacement: %s", command);
+ 	free_argv(argc, argv);
++
++	if (launch) {
++		argv = NULL;
++		argc = 0;
++		struct launch_args launch_args = {0};
++		read_config_launch(&launch_args, command);
++		free(command);
++		if (launch_args.empty) {
++			results = launch_empty_error(&launch_args);
++			launch_args_finish(&launch_args);
++			goto cleanup;
++		}
++		argv = launch_argv(&launch_args, &argc);
++		if (!argv) {
++			launch_args_finish(&launch_args);
++			results = cmd_results_new(CMD_FAILURE, "Unable to allocate arguments");
++			goto cleanup;
++		}
++		results = handler->handle(argc - 1, argv + 1);
++		if (launch_args.tail) {
++			// A deferred command still runs later, and one run now has run,
++			// but the line is reported as an error either way
++			if (results->status == CMD_DEFER && !results->error) {
++				free_cmd_results(results);
++				results = launch_tail_error(&launch_args, CMD_DEFER);
++			} else if (results->status == CMD_SUCCESS) {
++				free_cmd_results(results);
++				results = launch_tail_error(&launch_args, CMD_INVALID);
++			}
++		}
++		launch_args_finish(&launch_args);
++		goto cleanup;
++	}
++
+ 	argv = split_args(command, &argc);
++	char *stored = NULL;
++	if (stores_commands) {
++		// The stored commands are prepared from their first launch command on
++		const char *pos = command;
++		for (int i = 0; i < argc; ++i) {
++			pos += strspn(pos, whitespace);
++			if (i > 0 && is_launch_name(argv[i])) {
++				stored = store_commands(pos);
++				if (!stored) {
++					break;
++				}
++				for (int j = i; j < argc; ++j) {
++					free(argv[j]);
++					argv[j] = NULL;
++				}
++				argv[i] = stored;
++				argc = i + 1;
++				break;
++			}
++			pos += strlen(argv[i]);
++		}
++	}
+ 	free(command);
+ 
+ 	// Strip quotes and unescape the string
+ 	for (int i = handler->handle == cmd_set || handler->handle == cmd_set_from_resource ? 2 : 1; i < argc; ++i) {
++		if (argv[i] == stored) {
++			continue;
++		}
+ 		if (handler->handle != cmd_exec && handler->handle != cmd_exec_always
+ 				&& handler->handle != cmd_mode
+ 				&& handler->handle != cmd_bindsym
+@@ -441,6 +1006,7 @@ struct cmd_results *config_command(char *exec, char **new_block) {
+ 
+ cleanup:
+ 	free_argv(argc, argv);
++	free(joined_line);
+ 	return results;
+ }
+ 
+diff --git a/sway/commands/exec_always.c b/sway/commands/exec_always.c
+--- a/sway/commands/exec_always.c
++++ b/sway/commands/exec_always.c
+@@ -26,23 +26,14 @@ struct cmd_results *cmd_exec_validate(int argc, char **argv) {
+ }
+ 
+ struct cmd_results *cmd_exec_process(int argc, char **argv) {
+-	struct cmd_results *error = NULL;
+-	char *cmd = NULL;
+ 	bool no_startup_id = false;
+-	if (strcmp(argv[0], "--no-startup-id") == 0) {
++	if (argc > 1 && strcmp(argv[0], "--no-startup-id") == 0) {
+ 		no_startup_id = true;
+ 		--argc; ++argv;
+-		if ((error = checkarg(argc, argv[-1], EXPECTED_AT_LEAST, 1))) {
+-			return error;
+-		}
+ 	}
+ 
+-	if (argc == 1 && (argv[0][0] == '\'' || argv[0][0] == '"')) {
+-		cmd = strdup(argv[0]);
+-		strip_quotes(cmd);
+-	} else {
+-		cmd = join_args(argv, argc);
+-	}
++	// The quotes and backslashes in the command have already been read
++	char *cmd = join_args(argv, argc);
+ 
+ 	sway_log(SWAY_DEBUG, "Executing %s", cmd);
+ 
+diff --git a/sway/config.c b/sway/config.c
+--- a/sway/config.c
++++ b/sway/config.c
+@@ -636,7 +636,7 @@ void run_deferred_commands(void) {
+ 	sway_log(SWAY_DEBUG, "Running deferred commands");
+ 	while (config->cmd_queue->length) {
+ 		char *line = config->cmd_queue->items[0];
+-		list_t *res_list = execute_command(line, NULL, NULL);
++		list_t *res_list = execute_deferred_command(line);
+ 		for (int i = 0; i < res_list->length; ++i) {
+ 			struct cmd_results *res = res_list->items[i];
+ 			if (res->status != CMD_SUCCESS) {
+@@ -735,6 +735,18 @@ static char *expand_line(const char *block, const char *line, bool add_brace) {
+ 	return expanded;
+ }
+ 
++static void config_line_error(struct sway_config *config,
++		struct swaynag_instance *swaynag, int line_number, const char *line,
++		const char *error) {
++	sway_log(SWAY_ERROR, "Error on line %i '%s': %s (%s)", line_number,
++		line, error, config->current_config_path);
++	if (!config->validating) {
++		swaynag_log(config->swaynag_command, swaynag,
++			"Error on line %i (%s) '%s': %s", line_number,
++			config->current_config_path, line, error);
++	}
++}
++
+ bool read_config(FILE *file, struct sway_config *config,
+ 		struct swaynag_instance *swaynag) {
+ 	bool reading_main_config = false;
+@@ -817,17 +829,16 @@ bool read_config(FILE *file, struct sway_config *config,
+ 		switch(res->status) {
+ 		case CMD_FAILURE:
+ 		case CMD_INVALID:
+-			sway_log(SWAY_ERROR, "Error on line %i '%s': %s (%s)", line_number,
+-				line, res->error, config->current_config_path);
+-			if (!config->validating) {
+-				swaynag_log(config->swaynag_command, swaynag,
+-					"Error on line %i (%s) '%s': %s", line_number,
+-					config->current_config_path, line, res->error);
+-			}
++			config_line_error(config, swaynag, line_number, line, res->error);
+ 			success = false;
+ 			break;
+ 
+ 		case CMD_DEFER:
++			if (res->error) {
++				// The command still runs later, but is in error as written
++				config_line_error(config, swaynag, line_number, line, res->error);
++				success = false;
++			}
+ 			sway_log(SWAY_DEBUG, "Deferring command `%s'", line);
+ 			list_add(config->cmd_queue, strdup(expanded));
+ 			break;
+diff --git a/sway/ipc-server.c b/sway/ipc-server.c
+--- a/sway/ipc-server.c
++++ b/sway/ipc-server.c
+@@ -637,17 +637,7 @@ void ipc_client_handle_command(struct ipc_client *client, uint32_t payload_lengt
+ 	switch (payload_type) {
+ 	case IPC_COMMAND:
+ 	{
+-		char *line = strtok(buf, "\n");
+-		while (line) {
+-			size_t line_length = strlen(line);
+-			if (line + line_length >= buf + payload_length) {
+-				break;
+-			}
+-			line[line_length] = ';';
+-			line = strtok(NULL, "\n");
+-		}
+-
+-		list_t *res_list = execute_command(buf, NULL, NULL);
++		list_t *res_list = execute_ipc_command(buf, payload_length);
+ 		if (modeset_is_pending()) {
+ 			// IPC expects commands to have taken immediate effect, so we need
+ 			// to force a modeset after output commands. We do a single modeset
+diff --git a/sway/sway.5.scd b/sway/sway.5.scd
+--- a/sway/sway.5.scd
++++ b/sway/sway.5.scd
+@@ -708,6 +708,36 @@ The default colors are:
+ *exec* <shell command>
+ 	Executes _shell command_ with sh.
+ 
++	Quotes and backslashes in _shell command_ are read as i3 reads them, in
++	one of two ways.
++
++	In a config file line, at startup and on *reload* alike, a _shell command_
++	that starts with a double quote ends at the next double quote that has no
++	backslash directly in front of it. Anything but blanks after that quote is
++	reported as an error, although the command still runs. Any other _shell
++	command_ is the rest of the line, including any *;* or *,*. Only a
++	backslash directly in front of a double quote is removed.
++
++	Through *swaymsg*(1), and in a binding or *for_window* rule when it fires,
++	a backslash in a double-quoted _shell command_ always takes the next
++	character along with it, and only blanks may follow the closing quote
++	before the next *;*, *,* or line break. Anything else there is an error,
++	and the commands after it do not run. Any other _shell command_ ends at the
++	first *;*, *,* or line break that is not inside quotes. A backslash in
++	front of a double quote or in front of another backslash is removed.
++
++	A binding or rule written in the config file is read the first way when
++	the file is loaded and the second way when it fires, so it needs doubled
++	backslashes. In both readings, a _shell command_ that is exactly one
++	single-quoted string is run without those quotes, and an empty pair of
++	double quotes is an error. For example, to run a program whose path
++	contains a space:
++
++	```
++	exec "\\"/opt/My App/run me.sh\\" --flag"
++	bindsym $mod+y exec "\\\\"/opt/My App/run me.sh\\\\" --flag"
++	```
++
+ *exec_always* <shell command>
+ 	Like *exec*, but the shell command will be executed _again_ after *reload*.
+ 

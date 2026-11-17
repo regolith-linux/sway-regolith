@@ -1,0 +1,106 @@
+#!/bin/sh
+# 21-exec-quoting-parity: exec and exec_always read quotes and backslashes
+# as i3 does, the same at startup and after a reload, from a key binding and
+# over IPC. The program lives in a directory whose name has a space, and
+# records the arguments it receives.
+set -eu
+. debian/tests/lib-headless.sh
+in_dbus_session "$@"
+setup_runtime
+
+LOG="$WORK/argv.log"
+mkdir "$WORK/My App"
+PROG="$WORK/My App/run me.sh"
+cat > "$PROG" <<EOF2
+#!/bin/sh
+{ for a in "\$@"; do printf '%s|' "\$a"; done; echo; } >> "$LOG"
+EOF2
+chmod +x "$PROG"
+: > "$LOG"
+
+# Config reading: only \" loses its backslash. In a binding the backslashes
+# are doubled, because it is read again when it fires.
+sed "s|@PROG@|$PROG|g" > "$WORK/config" <<'EOF2'
+swaynag_command -
+set $ex exec
+exec "\"@PROG@\" start 'a\nb' 'c\\d'"
+exec_always "\"@PROG@\" always 'a\nb' 'c\\d'"
+bindsym Mod4+y exec "\\"@PROG@\\" bind 'a\\nb' 'c\\\\d'"
+EOF2
+
+# wait_line LINE: wait until the recorder has logged LINE.
+wait_line() {
+	i=0
+	until grep -qxF -- "$1" "$LOG"; do
+		i=$((i + 1))
+		if [ "$i" -gt 50 ]; then
+			echo "--- recorded:"; cat "$LOG"; echo "--- sway log:"; cat "$WORK/sway.log"
+			# printf, not fail's echo, which would expand the \n in LINE
+			printf "FAIL: expected the program to receive '%s'\n" "$1"
+			exit 1
+		fi
+		sleep 0.2
+	done
+}
+
+start_sway "$WORK/config"
+wait_line 'start|a\nb|c\\d|'
+wait_line 'always|a\nb|c\\d|'
+
+: > "$LOG"
+swaymsg reload > /dev/null || true
+wait_line 'always|a\nb|c\\d|'
+sleep 1
+[ "$(grep -c . "$LOG")" -eq 1 ] || { cat "$LOG"; fail "exec ran again on reload"; }
+
+for socket in "$XDG_RUNTIME_DIR"/wayland-*; do
+	case "$socket" in *.lock) continue ;; esac
+	export WAYLAND_DISPLAY="${socket##*/}"
+done
+wtype -M logo -k y -m logo
+wait_line 'bind|a\nb|c\\d|'
+
+# Runtime reading over IPC: \" and \\ lose a backslash, a quoted line break
+# stays a line break, and text after the closing quote stops the commands.
+msg=$(sed "s|@PROG@|$PROG|g" <<'EOF2'
+exec "\"@PROG@\" ipc 'a\nb' 'c\\\\d'"
+EOF2
+)
+swaymsg -- "$msg" > /dev/null
+wait_line 'ipc|a\nb|c\\d|'
+
+# 08-variable-command-name: a variable holding exec reads the same way.
+# shellcheck disable=SC2016 # $ex is for sway to replace
+msg=$(printf '$ex "\\"%s\\" var"' "$PROG")
+swaymsg -- "$msg" > /dev/null
+wait_line 'var|'
+
+msg=$(printf 'exec "\\"%s\\" multi '"'"'x\ny'"'"'"' "$PROG")
+swaymsg -- "$msg" > /dev/null
+wait_line 'multi|x'
+wait_line 'y|'
+
+msg=$(printf 'exec "\\"%s\\" first" junk; exec "\\"%s\\" never"' "$PROG" "$PROG")
+reply=$(swaymsg -r -- "$msg" || true)
+echo "reply: $reply"
+echo "$reply" | jq -e 'length == 2 and .[0].success and (.[1].success | not)' > /dev/null ||
+	fail "unexpected reply to a command with text after the closing quote"
+wait_line 'first|'
+sleep 1
+! grep -qxF 'never|' "$LOG" || fail "a command after the error ran"
+
+# Text after the closing quote of a config line is a config error, but the
+# quoted command still runs.
+kill "$SWAY_PID"
+wait "$SWAY_PID" 2>/dev/null || true
+: > "$LOG"
+sed "s|@PROG@|$PROG|g" > "$WORK/config" <<'EOF2'
+swaynag_command -
+exec "\"@PROG@\" tail" junk
+EOF2
+start_sway "$WORK/config"
+wait_line 'tail|'
+grep -qF "expected only blanks after the closing quote, got 'junk'" "$WORK/sway.log" ||
+	fail "text after the closing quote was not reported"
+
+echo "PASS: exec-quoting"
