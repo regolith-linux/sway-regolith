@@ -1,0 +1,366 @@
+Description: Make mouse_warping output follow the focus across outputs, like i3
+ Regolith runs both sessions with mouse_warping output. In sway the
+ pointer was warped from inside the focus code on any focus change that
+ left the focus on another output than the pointer, so it behaved unlike
+ i3 both ways. A window opening or closing on the focused output pulled
+ the pointer over from the other output, and a command that moved the
+ focus away and back still warped it. Moving the focused window onto the
+ other output (move left/right, or a fullscreen request naming that
+ output) left the pointer behind, and focus arriving at a floating window
+ that sticks out past the edge of the layout did not move it at all.
+ .
+ The focused output of every seat is now recorded when the outermost
+ command list starts. Once it has finished, the pointer of each seat
+ whose focused output changed is moved to the middle of the focused
+ window or workspace, kept on that output, unless it is already there.
+ Window activation and fullscreen requests from clients are handled the
+ same way. While a launcher or another layer surface has the keyboard,
+ the window that gets it back counts as focused. mouse_warping container
+ and none are unchanged.
+Author: rego-port-bot <339843353+rego-port-bot@users.noreply.github.com>
+Bug: https://github.com/swaywm/sway/issues/8001
+Bug: https://github.com/swaywm/sway/issues/8848
+Forwarded: https://github.com/swaywm/sway/compare/master...cfsmp3:sway-regolith:ubuntu/mouse-warping-output
+Last-Update: 2026-11-17
+---
+--- a/include/sway/input/input-manager.h
++++ b/include/sway/input/input-manager.h
+@@ -45,6 +45,19 @@ bool input_manager_has_focus(struct sway
+ 
+ void input_manager_set_focus(struct sway_node *node);
+ 
++/**
++ * Record the focused output of every seat, for
++ * input_manager_consider_warp_to_outputs() once focus may have moved.
++ */
++list_t *input_manager_get_focused_outputs(void);
++
++/**
++ * Call seat_consider_warp_to_output() for every seat recorded in
++ * `prev_outputs` with the output it had focused then, and free the list.
++ * Seats created since the list was made are left alone.
++ */
++void input_manager_consider_warp_to_outputs(list_t *prev_outputs);
++
+ void input_manager_configure_xcursor(void);
+ 
+ void input_manager_apply_input_config(struct input_config *input_config);
+--- a/include/sway/input/seat.h
++++ b/include/sway/input/seat.h
+@@ -220,6 +220,13 @@ struct sway_node *seat_get_focus(struct
+ 
+ struct sway_workspace *seat_get_focused_workspace(struct sway_seat *seat);
+ 
++/**
++ * Return the output of the seat's focused node, or NULL if there is none.
++ * While a layer surface has keyboard focus, this is the output of the node
++ * that gets focus back when the layer surface releases it.
++ */
++struct sway_output *seat_get_focused_output(struct sway_seat *seat);
++
+ // If a scratchpad container is fullscreen global, this can be used to try to
+ // determine the last focused workspace. Otherwise, this should yield the same
+ // results as seat_get_focused_workspace.
+@@ -310,8 +317,22 @@ struct sway_container *seat_get_focus_in
+ void seat_pointer_notify_button(struct sway_seat *seat, uint32_t time_msec,
+ 		uint32_t button, enum wl_pointer_button_state state);
+ 
++/**
++ * With `mouse_warping container`, warp the cursor to the focused container or
++ * workspace. Does nothing in the other modes.
++ */
+ void seat_consider_warp_to_focus(struct sway_seat *seat);
+ 
++/**
++ * With `mouse_warping output`, warp the cursor to the middle of the focused
++ * container or workspace (clamped to its output) if the focused output is no
++ * longer `prev_output` and the cursor is not already on it. While a layer
++ * surface has keyboard focus, the node that gets focus back counts as focused.
++ * Does nothing in the other modes.
++ */
++void seat_consider_warp_to_output(struct sway_seat *seat,
++		struct sway_output *prev_output);
++
+ void seatop_button(struct sway_seat *seat, uint32_t time_msec,
+ 		struct wlr_input_device *device, uint32_t button,
+ 		enum wl_pointer_button_state state);
+--- a/sway/commands.c
++++ b/sway/commands.c
+@@ -226,6 +226,13 @@ list_t *execute_command(char *_exec, str
+ 		return NULL;
+ 	}
+ 
++	// Only the outermost command list decides whether cursors follow focus to
++	// another output; nested ones (such as for_window rules run by a command)
++	// are part of it. Any seat's focus can be moved, so record every seat
++	static int depth = 0;
++	list_t *prev_outputs =
++		depth++ == 0 ? input_manager_get_focused_outputs() : NULL;
++
+ 	config->handler_context.seat = seat;
+ 
+ 	do {
+@@ -341,6 +348,9 @@ list_t *execute_command(char *_exec, str
+ 		free_argv(argc, argv);
+ 	} while(head);
+ cleanup:
++	if (--depth == 0) {
++		input_manager_consider_warp_to_outputs(prev_outputs);
++	}
+ 	free(exec);
+ 	list_free(containers);
+ 	return res_list;
+--- a/sway/commands/focus.c
++++ b/sway/commands/focus.c
+@@ -280,8 +280,6 @@ static struct cmd_results *focus_mode(st
+ 		// to anyway.
+ 		if (config->mouse_warping == WARP_CONTAINER) {
+ 			cursor_warp_to_container(seat->cursor, new_focus, true);
+-		} else {
+-			seat_consider_warp_to_focus(seat);
+ 		}
+ 	} else {
+ 		return cmd_results_new(CMD_FAILURE,
+--- a/sway/desktop/xdg_shell.c
++++ b/sway/desktop/xdg_shell.c
+@@ -386,6 +386,7 @@ static void handle_request_fullscreen(st
+ 		return;
+ 	}
+ 
++	list_t *prev_outputs = input_manager_get_focused_outputs();
+ 	struct sway_container *container = view->container;
+ 	struct wlr_xdg_toplevel_requested *req = &toplevel->requested;
+ 	if (req->fullscreen && req->fullscreen_output && req->fullscreen_output->data) {
+@@ -404,6 +405,8 @@ static void handle_request_fullscreen(st
+ 	container_set_fullscreen(container, req->fullscreen);
+ 
+ 	arrange_root();
++	// Moving the container to another output can take focus with it
++	input_manager_consider_warp_to_outputs(prev_outputs);
+ 	transaction_commit_dirty();
+ }
+ 
+--- a/sway/input/input-manager.c
++++ b/sway/input/input-manager.c
+@@ -1,5 +1,6 @@
+ #include <ctype.h>
+ #include <stdio.h>
++#include <stdlib.h>
+ #include <string.h>
+ #include <math.h>
+ #include <assert.h>
+@@ -520,6 +521,48 @@ void input_manager_set_focus(struct sway
+ 	}
+ }
+ 
++struct seat_focused_output {
++	struct sway_seat *seat;
++	struct sway_output *output;
++};
++
++list_t *input_manager_get_focused_outputs(void) {
++	list_t *outputs = create_list();
++	if (!outputs) {
++		return NULL;
++	}
++	struct sway_seat *seat;
++	wl_list_for_each(seat, &server.input->seats, link) {
++		struct seat_focused_output *entry = malloc(sizeof(*entry));
++		if (!entry) {
++			continue;
++		}
++		entry->seat = seat;
++		entry->output = seat_get_focused_output(seat);
++		list_add(outputs, entry);
++	}
++	return outputs;
++}
++
++void input_manager_consider_warp_to_outputs(list_t *prev_outputs) {
++	if (!prev_outputs) {
++		return;
++	}
++	// Match seats by pointer: a command can create a seat, and new seats are
++	// added at the front of the list
++	struct sway_seat *seat;
++	wl_list_for_each(seat, &server.input->seats, link) {
++		for (int i = 0; i < prev_outputs->length; i++) {
++			struct seat_focused_output *entry = prev_outputs->items[i];
++			if (entry->seat == seat) {
++				seat_consider_warp_to_output(seat, entry->output);
++				break;
++			}
++		}
++	}
++	list_free_items_and_destroy(prev_outputs);
++}
++
+ /**
+  * Re-translate keysyms if a change in the input config could affect them.
+  */
+--- a/sway/input/seat.c
++++ b/sway/input/seat.c
+@@ -1573,6 +1573,22 @@ struct sway_workspace *seat_get_focused_
+ 	return NULL; // output doesn't have a workspace yet
+ }
+ 
++/**
++ * Like seat_get_focus(), but while a layer surface has keyboard focus, return
++ * the node that gets it back when the layer surface releases it.
++ */
++static struct sway_node *seat_get_focus_below_layer(struct sway_seat *seat) {
++	if (seat->focused_layer) {
++		return seat_get_focus_inactive(seat, &root->node);
++	}
++	return seat_get_focus(seat);
++}
++
++struct sway_output *seat_get_focused_output(struct sway_seat *seat) {
++	struct sway_node *focus = seat_get_focus_below_layer(seat);
++	return focus ? node_get_output(focus) : NULL;
++}
++
+ struct sway_workspace *seat_get_last_known_workspace(struct sway_seat *seat) {
+ 	struct sway_seat_node *current;
+ 	wl_list_for_each(current, &seat->focus_stack, link) {
+@@ -1645,20 +1661,9 @@ void seat_pointer_notify_button(struct s
+ 
+ void seat_consider_warp_to_focus(struct sway_seat *seat) {
+ 	struct sway_node *focus = seat_get_focus(seat);
+-	if (config->mouse_warping == WARP_NO || !focus) {
++	if (config->mouse_warping != WARP_CONTAINER || !focus) {
+ 		return;
+ 	}
+-	if (config->mouse_warping == WARP_OUTPUT) {
+-		struct sway_output *output = node_get_output(focus);
+-		if (output) {
+-			struct wlr_box box;
+-			output_get_box(output, &box);
+-			if (wlr_box_contains_point(&box,
+-						seat->cursor->cursor->x, seat->cursor->cursor->y)) {
+-				return;
+-			}
+-		}
+-	}
+ 
+ 	if (focus->type == N_CONTAINER) {
+ 		cursor_warp_to_container(seat->cursor, focus->sway_container, false);
+@@ -1667,6 +1672,41 @@ void seat_consider_warp_to_focus(struct
+ 	}
+ }
+ 
++void seat_consider_warp_to_output(struct sway_seat *seat,
++		struct sway_output *prev_output) {
++	struct sway_node *focus = seat_get_focus_below_layer(seat);
++	if (config->mouse_warping != WARP_OUTPUT || !focus) {
++		return;
++	}
++	struct sway_output *output = node_get_output(focus);
++	if (!output || output == prev_output) {
++		return;
++	}
++	struct wlr_box box;
++	output_get_box(output, &box);
++	if (wlr_box_contains_point(&box,
++				seat->cursor->cursor->x, seat->cursor->cursor->y)) {
++		return;
++	}
++
++	double x, y;
++	if (focus->type == N_CONTAINER) {
++		struct sway_container *con = focus->sway_container;
++		x = con->pending.x + con->pending.width / 2.0;
++		y = con->pending.y + con->pending.height / 2.0;
++	} else {
++		struct sway_workspace *ws = focus->sway_workspace;
++		x = ws->x + ws->width / 2.0;
++		y = ws->y + ws->height / 2.0;
++	}
++	// A floating container can stick out of its output; keep the cursor on
++	// the output that has focus
++	wlr_box_closest_point(&box, x, y, &x, &y);
++
++	wlr_cursor_warp(seat->cursor->cursor, NULL, x, y);
++	cursor_unhide(seat->cursor);
++}
++
+ void seatop_unref(struct sway_seat *seat, struct sway_container *con) {
+ 	if (seat->seatop_impl->unref) {
+ 		seat->seatop_impl->unref(seat, con);
+--- a/sway/sway.5.scd
++++ b/sway/sway.5.scd
+@@ -838,8 +838,15 @@ The default colors are:
+ 
+ *mouse_warping* output|container|none
+ 	If _output_ is specified, the mouse will be moved to new outputs as you
+-	move focus between them. If _container_ is specified, the mouse will be
+-	moved to the middle of the container on switch. Default is _output_.
++	move focus between them: when a command, a window activation request or a
++	fullscreen request leaves a seat's focus on another output, and that seat's
++	mouse is not already on it, the mouse is moved to the middle of the focused
++	container or workspace, or to the nearest point of the output if that
++	middle lies outside it. A command that ends on the output it started on
++	does not move the mouse, nor does a window opening or closing. While a
++	layer surface such as a launcher has keyboard focus, the window that gets
++	focus back counts as focused. If _container_ is specified, the mouse will
++	be moved to the middle of the container on switch. Default is _output_.
+ 
+ *no_focus* <criteria>
+ 	Prevents windows matching <criteria> from being focused automatically when
+--- a/sway/tree/view.c
++++ b/sway/tree/view.c
+@@ -24,6 +24,7 @@
+ #include "sway/desktop/idle_inhibit_v1.h"
+ #include "sway/desktop/launcher.h"
+ #include "sway/input/cursor.h"
++#include "sway/input/input-manager.h"
+ #include "sway/ipc-server.h"
+ #include "sway/output.h"
+ #include "sway/input/seat.h"
+@@ -417,6 +418,7 @@ void view_request_activate(struct sway_v
+ 	if (!seat) {
+ 		seat = input_manager_current_seat();
+ 	}
++	struct sway_output *prev_output = seat_get_focused_output(seat);
+ 
+ 	switch (config->focus_on_window_activation) {
+ 	case FOWA_SMART:
+@@ -441,6 +443,7 @@ void view_request_activate(struct sway_v
+ 	case FOWA_NONE:
+ 		break;
+ 	}
++	seat_consider_warp_to_output(seat, prev_output);
+ 	transaction_commit_dirty();
+ }
+ 
+@@ -677,11 +680,13 @@ static void handle_foreign_activate_requ
+ 	struct sway_seat *seat;
+ 	wl_list_for_each(seat, &server.input->seats, link) {
+ 		if (seat->wlr_seat == event->seat) {
++			struct sway_output *prev_output = seat_get_focused_output(seat);
+ 			if (container_is_scratchpad_hidden_or_child(view->container)) {
+ 				root_scratchpad_show(view->container);
+ 			}
+ 			seat_set_focus_container(seat, view->container);
+ 			seat_consider_warp_to_focus(seat);
++			seat_consider_warp_to_output(seat, prev_output);
+ 			container_raise_floating(view->container);
+ 			break;
+ 		}
+@@ -694,6 +699,7 @@ static void handle_foreign_fullscreen_re
+ 	struct sway_view *view = wl_container_of(
+ 			listener, view, foreign_fullscreen_request);
+ 	struct wlr_foreign_toplevel_handle_v1_fullscreen_event *event = data;
++	list_t *prev_outputs = input_manager_get_focused_outputs();
+ 
+ 	// Match fullscreen command behavior for scratchpad hidden views
+ 	struct sway_container *container = view->container;
+@@ -726,6 +732,8 @@ static void handle_foreign_fullscreen_re
+ 			arrange_workspace(container->pending.workspace);
+ 		}
+ 	}
++	// Moving the container to another output can take focus with it
++	input_manager_consider_warp_to_outputs(prev_outputs);
+ 	transaction_commit_dirty();
+ }
+ 
