@@ -1,0 +1,908 @@
+Description: swaynag: opt-in keyboard control
+ The bar shown before logging out, restarting or powering off could only
+ be operated with a pointer: keys kept going to the focused window, so
+ someone without a mouse could neither accept nor decline. The X11
+ end-session dialog holds the keyboard, focuses its accept button and
+ takes Return, space, Escape, Tab and the arrow keys.
+ .
+ swaynag gains a per-type keyboard-control=yes|no setting (also
+ --keyboard-control, never abbreviated), off by default. When enabled the
+ layer surface requests keyboard interactivity, so the bar takes the
+ keyboard as soon as it is mapped, and keys are interpreted by keysym
+ with the keymap and modifiers sent by the compositor. Exactly one button
+ has focus, initially the first action button given (or the dismiss
+ button). Tab and Shift+Tab (ISO_Left_Tab, or Tab with Shift) move it
+ right or left and wrap; Right and Left do the same without wrapping.
+ Return, KP_Enter and space press the focused button as a click would,
+ once per physical press; Escape dismisses with status 0. With the
+ details shown and overflowing, Up/Down scroll a line, Page Up/Page Down
+ a page, Home/End to either end, within the limits of the scroll buttons.
+ Navigation and scrolling keys repeat with the compositor's repeat rate
+ and delay. Keys with Ctrl, Alt or Super are ignored, as are shifted keys
+ other than Tab and the activation keys.
+ .
+ The focused button's border is drawn in the new focus-border color
+ (--focus-border), which defaults to the resolved button-text color;
+ with a zero button border a one pixel frame is drawn inside the button.
+ The frame is drawn last, so the bottom border of the bar cannot cover it.
+ Keys can change the bar faster than the compositor releases buffers, so
+ a frame skipped for lack of a free buffer is drawn once one is released.
+ Values other than yes and no are rejected with exit status 1. Without
+ the setting nothing changes.
+Author: rego-port-bot <339843353+rego-port-bot@users.noreply.github.com>
+Bug: https://github.com/swaywm/sway/issues/7251
+Forwarded: no
+Last-Update: 2026-11-18
+---
+--- a/include/swaynag/swaynag.h
++++ b/include/swaynag/swaynag.h
+@@ -2,6 +2,7 @@
+ #define _SWAYNAG_SWAYNAG_H
+ #include <stdint.h>
+ #include <strings.h>
++#include <xkbcommon/xkbcommon.h>
+ #include "list.h"
+ #include "pool-buffer.h"
+ #include "cursor-shape-v1-client-protocol.h"
+@@ -28,11 +29,20 @@ struct swaynag_pointer {
+ 	int y;
+ };
+ 
++struct swaynag_keyboard {
++	struct wl_keyboard *keyboard;
++	struct xkb_keymap *keymap;
++	struct xkb_state *state;
++	int32_t repeat_rate; // keys per second, 0 disables repeat
++	int32_t repeat_delay; // milliseconds
++};
++
+ struct swaynag_seat {
+ 	struct wl_seat *wl_seat;
+ 	uint32_t wl_name;
+ 	struct swaynag *swaynag;
+ 	struct swaynag_pointer pointer;
++	struct swaynag_keyboard keyboard;
+ 	struct wl_list link;
+ };
+ 
+@@ -95,11 +105,20 @@ struct swaynag {
+ 	int32_t scale;
+ 	struct pool_buffer buffers[2];
+ 	struct pool_buffer *current_buffer;
++	bool redraw_pending; // a frame was skipped for lack of a free buffer
+ 
+ 	struct swaynag_type *type;
+ 	char *message;
+ 	list_t *buttons;
+ 	struct swaynag_details details;
++
++	// Keyboard control, only used when type->keyboard_control is enabled
++	int focused_button; // index into buttons
++	struct xkb_context *xkb_context;
++	int repeat_timer; // timerfd, -1 if not created
++	struct swaynag_seat *repeat_seat;
++	uint32_t repeat_key;
++	xkb_keysym_t repeat_sym;
+ };
+ 
+ void swaynag_setup(struct swaynag *swaynag);
+--- a/include/swaynag/types.h
++++ b/include/swaynag/types.h
+@@ -12,6 +12,7 @@ struct swaynag_type {
+ 	char *output;
+ 	uint32_t anchors;
+ 	int32_t layer; // enum zwlr_layer_shell_v1_layer or -1 if unset
++	int keyboard_control; // 1 for yes, 0 for no, or -1 if unset
+ 
+ 	// Colors
+ 	uint32_t button_text;
+@@ -21,6 +22,7 @@ struct swaynag_type {
+ 	uint32_t text;
+ 	uint32_t border;
+ 	uint32_t border_bottom;
++	uint32_t focus_border; // 0 if unset: falls back to button_text
+ 
+ 	// Sizing
+ 	ssize_t bar_border_thickness;
+--- a/swaynag/config.c
++++ b/swaynag/config.c
+@@ -1,6 +1,8 @@
+ #include <getopt.h>
++#include <stdbool.h>
+ #include <stdio.h>
+ #include <stdlib.h>
++#include <string.h>
+ #include <wordexp.h>
+ #include <unistd.h>
+ #include "log.h"
+@@ -46,6 +48,33 @@ freebuf:
+ 	return NULL;
+ }
+ 
++/**
++ * getopt_long accepts any unambiguous prefix of a long option. Checks whether
++ * the argument that named the option just parsed spells out its full name,
++ * alone or followed by '='. The argument is stored in given.
++ */
++static bool long_option_is_exact(char **argv, const char *name,
++		const char **given) {
++	// The value is either joined to the option or the following argument
++	const char *arg = optarg == argv[optind - 1] ?
++		argv[optind - 2] : argv[optind - 1];
++	*given = arg;
++	size_t len = strlen(name);
++	return strncmp(arg, "--", 2) == 0 && strncmp(arg + 2, name, len) == 0
++		&& (arg[len + 2] == '\0' || arg[len + 2] == '=');
++}
++
++static bool parse_yes_no(const char *value, int *result) {
++	if (strcmp(value, "yes") == 0) {
++		*result = 1;
++	} else if (strcmp(value, "no") == 0) {
++		*result = 0;
++	} else {
++		return false;
++	}
++	return true;
++}
++
+ int swaynag_parse_options(int argc, char **argv, struct swaynag *swaynag,
+ 		list_t *types, struct swaynag_type *type, char **config, bool *debug) {
+ 	enum type_options {
+@@ -56,6 +85,7 @@ int swaynag_parse_options(int argc, char
+ 		TO_COLOR_DETAILS,
+ 		TO_COLOR_TEXT,
+ 		TO_COLOR_BUTTON_TEXT,
++		TO_COLOR_FOCUS_BORDER,
+ 		TO_THICK_BAR_BORDER,
+ 		TO_PADDING_MESSAGE,
+ 		TO_THICK_DET_BORDER,
+@@ -64,6 +94,7 @@ int swaynag_parse_options(int argc, char
+ 		TO_GAP_BTN_DISMISS,
+ 		TO_MARGIN_BTN_RIGHT,
+ 		TO_PADDING_BTN,
++		TO_KEYBOARD_CONTROL,
+ 	};
+ 
+ 	static const struct option opts[] = {
+@@ -84,6 +115,7 @@ int swaynag_parse_options(int argc, char
+ 		{"dismiss-button", required_argument, NULL, 's'},
+ 		{"type", required_argument, NULL, 't'},
+ 		{"version", no_argument, NULL, 'v'},
++		{"keyboard-control", required_argument, NULL, TO_KEYBOARD_CONTROL},
+ 
+ 		{"background", required_argument, NULL, TO_COLOR_BACKGROUND},
+ 		{"border", required_argument, NULL, TO_COLOR_BORDER},
+@@ -91,6 +123,7 @@ int swaynag_parse_options(int argc, char
+ 		{"button-background", required_argument, NULL, TO_COLOR_BUTTON},
+ 		{"text", required_argument, NULL, TO_COLOR_TEXT},
+ 		{"button-text", required_argument, NULL, TO_COLOR_BUTTON_TEXT},
++		{"focus-border", required_argument, NULL, TO_COLOR_FOCUS_BORDER},
+ 		{"border-bottom-size", required_argument, NULL, TO_THICK_BAR_BORDER},
+ 		{"message-padding", required_argument, NULL, TO_PADDING_MESSAGE},
+ 		{"details-border-size", required_argument, NULL, TO_THICK_DET_BORDER},
+@@ -131,6 +164,8 @@ int swaynag_parse_options(int argc, char
+ 		"  -s, --dismiss-button <text>     Set the dismiss button text.\n"
+ 		"  -t, --type <type>               Set the message type.\n"
+ 		"  -v, --version                   Show the version number and quit.\n"
++		"  --keyboard-control yes|no       Take the keyboard and allow operating\n"
++		"                                  the buttons with it.\n"
+ 		"\n"
+ 		"The following appearance options can also be given:\n"
+ 		"  --background RRGGBB[AA]         Background color.\n"
+@@ -139,6 +174,8 @@ int swaynag_parse_options(int argc, char
+ 		"  --button-background RRGGBB[AA]  Button background color.\n"
+ 		"  --text RRGGBB[AA]               Text color.\n"
+ 		"  --button-text RRGGBB[AA]        Button text color.\n"
++		"  --focus-border RRGGBB[AA]       Border color of the keyboard focused\n"
++		"                                  button.\n"
+ 		"  --border-bottom-size size       Thickness of the bar border.\n"
+ 		"  --message-padding padding       Padding for the message.\n"
+ 		"  --details-border-size size      Thickness for the details border.\n"
+@@ -312,6 +349,11 @@ int swaynag_parse_options(int argc, char
+ 				fprintf(stderr, "Invalid button text color: %s", optarg);
+ 			}
+ 			break;
++		case TO_COLOR_FOCUS_BORDER:  // Keyboard focus border color
++			if (type && !parse_color(optarg, &type->focus_border)) {
++				fprintf(stderr, "Invalid focus border color: %s", optarg);
++			}
++			break;
+ 		case TO_THICK_BAR_BORDER:  // Bottom border thickness
+ 			if (type) {
+ 				type->bar_border_thickness = strtol(optarg, NULL, 0);
+@@ -352,6 +394,26 @@ int swaynag_parse_options(int argc, char
+ 				type->button_padding = strtol(optarg, NULL, 0);
+ 			}
+ 			break;
++		case TO_KEYBOARD_CONTROL: { // Keyboard control
++			const char *given;
++			if (!long_option_is_exact(argv, "keyboard-control", &given)) {
++				// Not available in abbreviated form
++				fprintf(stderr, "%s: unrecognized option '%s'\n",
++						argv[0], given);
++				fprintf(stderr, "%s", usage);
++				return -1;
++			}
++			int keyboard_control;
++			if (!parse_yes_no(optarg, &keyboard_control)) {
++				fprintf(stderr, "Invalid keyboard-control value: '%s' "
++						"(expected yes or no)\n", optarg);
++				return EXIT_FAILURE;
++			}
++			if (type) {
++				type->keyboard_control = keyboard_control;
++			}
++			break;
++		}
+ 		default: // Help or unknown flag
+ 			fprintf(c == 'h' ? stdout : stderr, "%s", usage);
+ 			return -1;
+--- a/swaynag/main.c
++++ b/swaynag/main.c
+@@ -22,6 +22,7 @@ int main(int argc, char **argv) {
+ 	swaynag.buttons = create_list();
+ 	wl_list_init(&swaynag.outputs);
+ 	wl_list_init(&swaynag.seats);
++	swaynag.repeat_timer = -1;
+ 
+ 	struct swaynag_button *button_close = calloc(1, sizeof(struct swaynag_button));
+ 	button_close->text = strdup("X");
+@@ -89,6 +90,15 @@ int main(int argc, char **argv) {
+ 		list_add(swaynag.buttons, swaynag.details.button_details);
+ 	}
+ 
++	// Keyboard focus starts on the first action button, which comes right
++	// after the dismiss button, or on the dismiss button if there is none
++	if (swaynag.buttons->length > 1) {
++		struct swaynag_button *first = swaynag.buttons->items[1];
++		if (first->type == SWAYNAG_ACTION_COMMAND) {
++			swaynag.focused_button = 1;
++		}
++	}
++
+ 	sway_log(SWAY_DEBUG, "Output: %s", swaynag.type->output);
+ 	sway_log(SWAY_DEBUG, "Anchors: %" PRIu32, swaynag.type->anchors);
+ 	sway_log(SWAY_DEBUG, "Type: %s", swaynag.type->name);
+--- a/swaynag/meson.build
++++ b/swaynag/meson.build
+@@ -15,6 +15,7 @@ executable(
+ 		rt,
+ 		wayland_client,
+ 		wayland_cursor,
++		xkbcommon,
+ 	],
+ 	link_with: [lib_sway_common, lib_sway_client],
+ 	install: true
+--- a/swaynag/render.c
++++ b/swaynag/render.c
+@@ -209,6 +209,34 @@ static uint32_t render_button(cairo_t *c
+ 	return ideal_surface_height;
+ }
+ 
++static void render_focus_frame(cairo_t *cairo, struct swaynag *swaynag) {
++	struct swaynag_button *button =
++		swaynag->buttons->items[swaynag->focused_button];
++	uint32_t color = swaynag->type->focus_border ?
++		swaynag->type->focus_border : swaynag->type->button_text;
++
++	// The frame replaces the button border. Without a border, it is drawn
++	// one pixel wide inside the button background instead.
++	int border = swaynag->type->button_border_thickness;
++	if (border < 0) {
++		border = 0;
++	}
++	int thickness = border > 0 ? border : 1;
++	int x = button->x - border;
++	int y = button->y - border;
++	int width = button->width + border * 2;
++	int height = button->height + border * 2;
++
++	cairo_set_source_u32(cairo, color);
++	cairo_rectangle(cairo, x, y, width, thickness);
++	cairo_rectangle(cairo, x, y + height - thickness, width, thickness);
++	cairo_rectangle(cairo, x, y + thickness,
++			thickness, height - thickness * 2);
++	cairo_rectangle(cairo, x + width - thickness, y + thickness,
++			thickness, height - thickness * 2);
++	cairo_fill(cairo);
++}
++
+ static uint32_t render_to_cairo(cairo_t *cairo, struct swaynag *swaynag) {
+ 	uint32_t max_height = 0;
+ 
+@@ -245,6 +273,11 @@ static uint32_t render_to_cairo(cairo_t
+ 			border);
+ 	cairo_fill(cairo);
+ 
++	// Drawn last, so that the bottom border does not hide part of it
++	if (swaynag->type->keyboard_control > 0) {
++		render_focus_frame(cairo, swaynag);
++	}
++
+ 	return max_height;
+ }
+ 
+@@ -252,6 +285,7 @@ void render_frame(struct swaynag *swayna
+ 	if (!swaynag->run_display) {
+ 		return;
+ 	}
++	swaynag->redraw_pending = false;
+ 
+ 	cairo_surface_t *recorder = cairo_recording_surface_create(
+ 			CAIRO_CONTENT_COLOR_ALPHA, NULL);
+@@ -275,6 +309,7 @@ void render_frame(struct swaynag *swayna
+ 				swaynag->height * swaynag->scale);
+ 		if (!swaynag->current_buffer) {
+ 			sway_log(SWAY_DEBUG, "Failed to get buffer. Skipping frame.");
++			swaynag->redraw_pending = true;
+ 			goto cleanup;
+ 		}
+ 
+--- a/swaynag/swaynag.1.scd
++++ b/swaynag/swaynag.1.scd
+@@ -83,6 +83,23 @@ _swaynag_ [options...]
+ *-v, --version*
+ 	Show the version number and quit.
+ 
++*--keyboard-control* yes|no
++	Allow operating swaynag with the keyboard. The default is _no_. When
++	enabled, swaynag takes the keyboard as soon as it appears, so typed keys
++	no longer reach the focused window. One button has keyboard focus,
++	initially the first action button that was given, or the dismiss button
++	if there is no action button. Focus moves through the buttons from left
++	to right: the details button, the action buttons, and the dismiss button.
++	Return, keypad Enter and space press the focused button, as a click
++	would. Escape dismisses swaynag. Tab and Shift+Tab move the focus to the
++	next or previous button, wrapping around at either end, and the Right
++	and Left arrow keys do the same without wrapping. While the details are
++	shown and do not fit, the Up and Down arrow keys scroll them by a line,
++	Page Up and Page Down by a page, and Home and End go to the beginning and
++	the end. Keys pressed together with Ctrl, Alt or Super are ignored. The
++	focused button is drawn with a border in the _--focus-border_ color.
++	Lower layers may not receive keyboard focus.
++
+ # APPEARANCE OPTIONS
+ 
+ *--background* <RRGGBB[AA]>
+@@ -103,6 +120,12 @@ _swaynag_ [options...]
+ *--button-text* <RRGGBB[AA]>
+ 	Set the button text color.
+ 
++*--focus-border* <RRGGBB[AA]>
++	Set the color of the border of the button that has keyboard focus when
++	_--keyboard-control_ is enabled. If the button border size is 0, a frame
++	one pixel wide is drawn inside the button instead. The default is the
++	button text color.
++
+ *--border-bottom-size* <size>
+ 	Set the thickness of the bottom border.
+ 
+--- a/swaynag/swaynag.5.scd
++++ b/swaynag/swaynag.5.scd
+@@ -45,6 +45,10 @@ colors can be set:
+ *button-text=<color>*
+ 	The color of the button text.
+ 
++*focus-border=<color>*
++	The color of the border of the button that has keyboard focus when
++	_keyboard-control_ is enabled. The default is the button text color.
++
+ The following sizing options can also be set:
+ 
+ *border-bottom-size=<size>*
+@@ -88,6 +92,10 @@ Additionally, the following options can
+ *output=<output>*
+ 	Set the output to use. This should be the name of a _xdg\_output_.
+ 
++*keyboard-control=yes|no*
++	Allow operating _swaynag_ with the keyboard. See swaynag(1) for the keys.
++	The default is _no_.
++
+ # EXAMPLE
+ 
+ ```
+--- a/swaynag/swaynag.c
++++ b/swaynag/swaynag.c
+@@ -1,10 +1,15 @@
+ #include <stdlib.h>
+ #include <assert.h>
++#include <errno.h>
++#include <poll.h>
++#include <sys/mman.h>
+ #include <sys/stat.h>
++#include <sys/timerfd.h>
+ #include <sys/wait.h>
+ #include <unistd.h>
+ #include <wayland-client.h>
+ #include <wayland-cursor.h>
++#include <xkbcommon/xkbcommon.h>
+ #include "log.h"
+ #include "list.h"
+ #include "swaynag/render.h"
+@@ -299,6 +304,299 @@ static const struct wl_pointer_listener
+ 	.axis_discrete = nop,
+ };
+ 
++static void stop_repeat(struct swaynag *swaynag) {
++	swaynag->repeat_seat = NULL;
++	if (swaynag->repeat_timer >= 0) {
++		struct itimerspec disarm = {0};
++		timerfd_settime(swaynag->repeat_timer, 0, &disarm, NULL);
++	}
++}
++
++static void start_repeat(struct swaynag *swaynag, struct swaynag_seat *seat,
++		uint32_t key, xkb_keysym_t sym) {
++	struct swaynag_keyboard *keyboard = &seat->keyboard;
++	if (swaynag->repeat_timer < 0 || keyboard->repeat_rate <= 0) {
++		return;
++	}
++	swaynag->repeat_seat = seat;
++	swaynag->repeat_key = key;
++	swaynag->repeat_sym = sym;
++
++	long interval = 1000000000L / keyboard->repeat_rate;
++	struct itimerspec spec = {
++		.it_interval = {
++			.tv_sec = interval / 1000000000L,
++			.tv_nsec = interval % 1000000000L,
++		},
++	};
++	if (keyboard->repeat_delay > 0) {
++		spec.it_value.tv_sec = keyboard->repeat_delay / 1000;
++		spec.it_value.tv_nsec = (keyboard->repeat_delay % 1000) * 1000000L;
++	} else {
++		spec.it_value = spec.it_interval;
++	}
++	if (timerfd_settime(swaynag->repeat_timer, 0, &spec, NULL) < 0) {
++		sway_log_errno(SWAY_ERROR, "Failed to arm the key repeat timer");
++		swaynag->repeat_seat = NULL;
++	}
++}
++
++static void move_focus(struct swaynag *swaynag, int delta, bool wrap) {
++	// Buttons are laid out from right to left in list order, so moving to
++	// the right means going towards the start of the list
++	int count = swaynag->buttons->length;
++	int focused = swaynag->focused_button - delta;
++	if (wrap) {
++		focused = (focused % count + count) % count;
++	} else if (focused < 0) {
++		focused = 0;
++	} else if (focused >= count) {
++		focused = count - 1;
++	}
++	if (focused != swaynag->focused_button) {
++		swaynag->focused_button = focused;
++		render_frame(swaynag);
++	}
++}
++
++static void scroll_details(struct swaynag *swaynag, xkb_keysym_t sym) {
++	struct swaynag_details *details = &swaynag->details;
++	// Only while the scroll buttons are shown
++	if (!details->visible || details->total_lines == details->visible_lines) {
++		return;
++	}
++
++	int bot = details->total_lines - details->visible_lines;
++	int offset = details->offset;
++	switch (sym) {
++	case XKB_KEY_Up:
++		offset--;
++		break;
++	case XKB_KEY_Down:
++		offset++;
++		break;
++	case XKB_KEY_Prior:
++		offset -= details->visible_lines;
++		break;
++	case XKB_KEY_Next:
++		offset += details->visible_lines;
++		break;
++	case XKB_KEY_Home:
++		offset = 0;
++		break;
++	case XKB_KEY_End:
++		offset = bot;
++		break;
++	}
++	if (offset > bot) {
++		offset = bot;
++	}
++	if (offset < 0) {
++		offset = 0;
++	}
++	if (offset != details->offset) {
++		details->offset = offset;
++		render_frame(swaynag);
++	}
++}
++
++static void handle_keysym(struct swaynag *swaynag, xkb_keysym_t sym) {
++	switch (sym) {
++	case XKB_KEY_Escape:
++		swaynag->run_display = false;
++		break;
++	case XKB_KEY_Return:
++	case XKB_KEY_KP_Enter:
++	case XKB_KEY_space:
++		swaynag_button_execute(swaynag,
++				swaynag->buttons->items[swaynag->focused_button]);
++		break;
++	case XKB_KEY_Tab:
++		move_focus(swaynag, 1, true);
++		break;
++	case XKB_KEY_ISO_Left_Tab:
++		move_focus(swaynag, -1, true);
++		break;
++	case XKB_KEY_Right:
++		move_focus(swaynag, 1, false);
++		break;
++	case XKB_KEY_Left:
++		move_focus(swaynag, -1, false);
++		break;
++	case XKB_KEY_Up:
++	case XKB_KEY_Down:
++	case XKB_KEY_Prior:
++	case XKB_KEY_Next:
++	case XKB_KEY_Home:
++	case XKB_KEY_End:
++		scroll_details(swaynag, sym);
++		break;
++	}
++}
++
++static bool keysym_repeats(xkb_keysym_t sym) {
++	switch (sym) {
++	case XKB_KEY_Tab:
++	case XKB_KEY_ISO_Left_Tab:
++	case XKB_KEY_Right:
++	case XKB_KEY_Left:
++	case XKB_KEY_Up:
++	case XKB_KEY_Down:
++	case XKB_KEY_Prior:
++	case XKB_KEY_Next:
++		return true;
++	default:
++		return false;
++	}
++}
++
++static bool keyboard_mod_active(struct swaynag_keyboard *keyboard,
++		const char *name) {
++	return xkb_state_mod_name_is_active(keyboard->state, name,
++			XKB_STATE_MODS_EFFECTIVE) > 0;
++}
++
++static void wl_keyboard_keymap(void *data, struct wl_keyboard *wl_keyboard,
++		uint32_t format, int32_t fd, uint32_t size) {
++	struct swaynag_seat *seat = data;
++	struct swaynag_keyboard *keyboard = &seat->keyboard;
++
++	if (format != WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1) {
++		close(fd);
++		sway_log(SWAY_ERROR, "Unsupported keymap format %d", format);
++		return;
++	}
++
++	char *map_shm = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
++	close(fd);
++	if (map_shm == MAP_FAILED) {
++		sway_log_errno(SWAY_ERROR, "Unable to map the keymap");
++		return;
++	}
++	struct xkb_keymap *keymap = xkb_keymap_new_from_buffer(
++			seat->swaynag->xkb_context, map_shm, strnlen(map_shm, size),
++			XKB_KEYMAP_FORMAT_TEXT_V1, XKB_KEYMAP_COMPILE_NO_FLAGS);
++	munmap(map_shm, size);
++	if (!keymap) {
++		sway_log(SWAY_ERROR, "Failed to compile the keymap");
++		return;
++	}
++	struct xkb_state *state = xkb_state_new(keymap);
++	if (!state) {
++		sway_log(SWAY_ERROR, "Failed to create the keyboard state");
++		xkb_keymap_unref(keymap);
++		return;
++	}
++
++	xkb_state_unref(keyboard->state);
++	xkb_keymap_unref(keyboard->keymap);
++	keyboard->keymap = keymap;
++	keyboard->state = state;
++}
++
++static void wl_keyboard_leave(void *data, struct wl_keyboard *wl_keyboard,
++		uint32_t serial, struct wl_surface *surface) {
++	struct swaynag_seat *seat = data;
++	if (seat->swaynag->repeat_seat == seat) {
++		stop_repeat(seat->swaynag);
++	}
++}
++
++static void wl_keyboard_key(void *data, struct wl_keyboard *wl_keyboard,
++		uint32_t serial, uint32_t time, uint32_t key, uint32_t key_state) {
++	struct swaynag_seat *seat = data;
++	struct swaynag *swaynag = seat->swaynag;
++	struct swaynag_keyboard *keyboard = &seat->keyboard;
++
++	if (key_state != WL_KEYBOARD_KEY_STATE_PRESSED) {
++		if (swaynag->repeat_seat == seat && swaynag->repeat_key == key) {
++			stop_repeat(swaynag);
++		}
++		return;
++	}
++	stop_repeat(swaynag);
++	if (!keyboard->state) {
++		return;
++	}
++
++	// Evdev scancodes are offset by 8 in xkb keycodes
++	xkb_keysym_t sym = xkb_state_key_get_one_sym(keyboard->state, key + 8);
++	if (keyboard_mod_active(keyboard, XKB_MOD_NAME_CTRL)
++			|| keyboard_mod_active(keyboard, XKB_MOD_NAME_ALT)
++			|| keyboard_mod_active(keyboard, XKB_MOD_NAME_LOGO)) {
++		return;
++	}
++	if (keyboard_mod_active(keyboard, XKB_MOD_NAME_SHIFT)) {
++		// Shift only moves focus backwards with Tab, and does not change
++		// activation. Any other shifted key does nothing.
++		switch (sym) {
++		case XKB_KEY_Tab:
++			sym = XKB_KEY_ISO_Left_Tab;
++			break;
++		case XKB_KEY_ISO_Left_Tab:
++		case XKB_KEY_Return:
++		case XKB_KEY_KP_Enter:
++		case XKB_KEY_space:
++			break;
++		default:
++			return;
++		}
++	}
++
++	// Arm the repeat first: rendering does a roundtrip, which may dispatch
++	// the release of this key before handle_keysym returns
++	if (keysym_repeats(sym)) {
++		start_repeat(swaynag, seat, key, sym);
++	}
++	handle_keysym(swaynag, sym);
++}
++
++static void wl_keyboard_modifiers(void *data, struct wl_keyboard *wl_keyboard,
++		uint32_t serial, uint32_t mods_depressed, uint32_t mods_latched,
++		uint32_t mods_locked, uint32_t group) {
++	struct swaynag_seat *seat = data;
++	if (seat->keyboard.state) {
++		xkb_state_update_mask(seat->keyboard.state, mods_depressed,
++				mods_latched, mods_locked, 0, 0, group);
++	}
++}
++
++static void wl_keyboard_repeat_info(void *data, struct wl_keyboard *wl_keyboard,
++		int32_t rate, int32_t delay) {
++	struct swaynag_seat *seat = data;
++	seat->keyboard.repeat_rate = rate;
++	seat->keyboard.repeat_delay = delay;
++}
++
++static const struct wl_keyboard_listener keyboard_listener = {
++	.keymap = wl_keyboard_keymap,
++	.enter = nop,
++	.leave = wl_keyboard_leave,
++	.key = wl_keyboard_key,
++	.modifiers = wl_keyboard_modifiers,
++	.repeat_info = wl_keyboard_repeat_info,
++};
++
++static void swaynag_keyboard_destroy(struct swaynag_seat *seat) {
++	struct swaynag_keyboard *keyboard = &seat->keyboard;
++	if (seat->swaynag->repeat_seat == seat) {
++		stop_repeat(seat->swaynag);
++	}
++	if (keyboard->keyboard) {
++		if (wl_keyboard_get_version(keyboard->keyboard) >=
++				WL_KEYBOARD_RELEASE_SINCE_VERSION) {
++			wl_keyboard_release(keyboard->keyboard);
++		} else {
++			wl_keyboard_destroy(keyboard->keyboard);
++		}
++		keyboard->keyboard = NULL;
++	}
++	xkb_state_unref(keyboard->state);
++	keyboard->state = NULL;
++	xkb_keymap_unref(keyboard->keymap);
++	keyboard->keymap = NULL;
++}
++
+ static void seat_handle_capabilities(void *data, struct wl_seat *wl_seat,
+ 		enum wl_seat_capability caps) {
+ 	struct swaynag_seat *seat = data;
+@@ -311,6 +609,16 @@ static void seat_handle_capabilities(voi
+ 		wl_pointer_destroy(seat->pointer.pointer);
+ 		seat->pointer.pointer = NULL;
+ 	}
++
++	bool cap_keyboard = caps & WL_SEAT_CAPABILITY_KEYBOARD;
++	if (cap_keyboard && !seat->keyboard.keyboard
++			&& seat->swaynag->type->keyboard_control > 0) {
++		seat->keyboard.keyboard = wl_seat_get_keyboard(wl_seat);
++		wl_keyboard_add_listener(seat->keyboard.keyboard,
++				&keyboard_listener, seat);
++	} else if (!cap_keyboard && seat->keyboard.keyboard) {
++		swaynag_keyboard_destroy(seat);
++	}
+ }
+ 
+ static const struct wl_seat_listener seat_listener = {
+@@ -369,8 +677,9 @@ static void handle_global(void *data, st
+ 
+ 		seat->swaynag = swaynag;
+ 		seat->wl_name = name;
+-		seat->wl_seat =
+-			wl_registry_bind(registry, name, &wl_seat_interface, 1);
++		// Version 4 announces the key repeat rate and delay
++		seat->wl_seat = wl_registry_bind(registry, name,
++				&wl_seat_interface, version < 4 ? version : 4);
+ 
+ 		wl_seat_add_listener(seat->wl_seat, &seat_listener, seat);
+ 
+@@ -404,6 +713,7 @@ static void handle_global(void *data, st
+ }
+ 
+ void swaynag_seat_destroy(struct swaynag_seat *seat) {
++	swaynag_keyboard_destroy(seat);
+ 	if (seat->pointer.cursor_theme) {
+ 		wl_cursor_theme_destroy(seat->pointer.cursor_theme);
+ 	}
+@@ -457,6 +767,19 @@ void swaynag_setup(struct swaynag *swayn
+ 
+ 	swaynag->scale = 1;
+ 
++	if (swaynag->type->keyboard_control > 0) {
++		swaynag->xkb_context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
++		if (!swaynag->xkb_context) {
++			sway_abort("Failed to create the xkb context");
++		}
++		swaynag->repeat_timer = timerfd_create(CLOCK_MONOTONIC,
++				TFD_NONBLOCK | TFD_CLOEXEC);
++		if (swaynag->repeat_timer < 0) {
++			sway_log_errno(SWAY_ERROR, "Failed to create the key repeat "
++					"timer, keys will not repeat");
++		}
++	}
++
+ 	struct wl_registry *registry = wl_display_get_registry(swaynag->display);
+ 	wl_registry_add_listener(registry, &registry_listener, swaynag);
+ 	if (wl_display_roundtrip(swaynag->display) < 0) {
+@@ -496,16 +819,69 @@ void swaynag_setup(struct swaynag *swayn
+ 			&layer_surface_listener, swaynag);
+ 	zwlr_layer_surface_v1_set_anchor(swaynag->layer_surface,
+ 			swaynag->type->anchors);
++	if (swaynag->type->keyboard_control > 0) {
++		zwlr_layer_surface_v1_set_keyboard_interactivity(
++				swaynag->layer_surface, true);
++	}
+ 
+ 	wl_registry_destroy(registry);
+ }
+ 
++static void handle_repeat_timer(struct swaynag *swaynag) {
++	uint64_t expirations;
++	if (read(swaynag->repeat_timer, &expirations, sizeof(expirations))
++			!= sizeof(expirations)) {
++		// Disarmed after poll returned, or spurious
++		return;
++	}
++	for (uint64_t i = 0; i < expirations && swaynag->run_display
++			&& swaynag->repeat_seat; i++) {
++		handle_keysym(swaynag, swaynag->repeat_sym);
++	}
++}
++
+ void swaynag_run(struct swaynag *swaynag) {
+ 	swaynag->run_display = true;
+ 	render_frame(swaynag);
+-	while (swaynag->run_display
+-			&& wl_display_dispatch(swaynag->display) != -1) {
+-		// This is intentionally left blank
++	if (swaynag->type->keyboard_control <= 0) {
++		while (swaynag->run_display
++				&& wl_display_dispatch(swaynag->display) != -1) {
++			// This is intentionally left blank
++		}
++		return;
++	}
++
++	// poll ignores the timer if it could not be created
++	struct pollfd fds[] = {
++		{ .fd = wl_display_get_fd(swaynag->display), .events = POLLIN },
++		{ .fd = swaynag->repeat_timer, .events = POLLIN },
++	};
++	while (swaynag->run_display) {
++		// Keys can change the bar faster than the compositor releases
++		// buffers. Draw a skipped frame once a buffer is free again.
++		if (swaynag->redraw_pending) {
++			render_frame(swaynag);
++		}
++		if (wl_display_flush(swaynag->display) == -1 && errno != EAGAIN) {
++			break;
++		}
++		if (poll(fds, sizeof(fds) / sizeof(fds[0]), -1) < 0) {
++			if (errno == EINTR) {
++				continue;
++			}
++			sway_log_errno(SWAY_ERROR, "poll failed");
++			break;
++		}
++		if (fds[0].revents & POLLIN) {
++			if (wl_display_dispatch(swaynag->display) == -1) {
++				break;
++			}
++		} else if (fds[0].revents & (POLLERR | POLLHUP)) {
++			break;
++		}
++		if (fds[1].revents & POLLIN) {
++			handle_repeat_timer(swaynag);
++		}
+ 	}
+ }
+ 
+@@ -542,6 +918,15 @@ void swaynag_destroy(struct swaynag *swa
+ 		swaynag_seat_destroy(seat);
+ 	}
+ 
++	if (swaynag->repeat_timer >= 0) {
++		close(swaynag->repeat_timer);
++		swaynag->repeat_timer = -1;
++	}
++	if (swaynag->xkb_context) {
++		xkb_context_unref(swaynag->xkb_context);
++		swaynag->xkb_context = NULL;
++	}
++
+ 	destroy_buffer(&swaynag->buffers[0]);
+ 	destroy_buffer(&swaynag->buffers[1]);
+ 
+--- a/swaynag/types.c
++++ b/swaynag/types.c
+@@ -26,6 +26,7 @@ struct swaynag_type *swaynag_type_new(co
+ 	type->button_margin_right = -1;
+ 	type->button_padding = -1;
+ 	type->layer = -1;
++	type->keyboard_control = -1;
+ 	return type;
+ }
+ 
+@@ -37,6 +38,7 @@ void swaynag_types_add_default(list_t *t
+ 		| ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT
+ 		| ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT;
+ 	type_defaults->layer = ZWLR_LAYER_SHELL_V1_LAYER_TOP;
++	type_defaults->keyboard_control = 0;
+ 	type_defaults->button_background = 0x333333FF;
+ 	type_defaults->details_background = 0x333333FF;
+ 	type_defaults->background = 0x323232FF;
+@@ -106,6 +108,10 @@ void swaynag_type_merge(struct swaynag_t
+ 		dest->layer = src->layer;
+ 	}
+ 
++	if (src->keyboard_control >= 0) {
++		dest->keyboard_control = src->keyboard_control;
++	}
++
+ 	// Colors
+ 	if (src->button_background > 0) {
+ 		dest->button_background = src->button_background;
+@@ -136,6 +142,10 @@ void swaynag_type_merge(struct swaynag_t
+ 		dest->border_bottom = src->border_bottom;
+ 	}
+ 
++	if (src->focus_border > 0) {
++		dest->focus_border = src->focus_border;
++	}
++
+ 	// Sizing
+ 	if (src->bar_border_thickness > -1) {
+ 		dest->bar_border_thickness = src->bar_border_thickness;

@@ -18,3 +18,4 @@
 16-floating-restore-next-to-sibling.patch
 17-sticky-keeps-focus-on-workspace-switch.patch
 18-move-direction-ppt.patch
+23-swaynag-keyboard-control.patch
