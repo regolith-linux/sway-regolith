@@ -1,0 +1,124 @@
+#!/bin/sh
+# 23-swaynag-keyboard-control: swaynag --keyboard-control yes takes the
+# keyboard when it appears and is operated with Tab, the arrow keys, Return
+# and Escape. Without it, keys keep going to the focused window.
+set -eu
+. debian/tests/lib-headless.sh
+in_dbus_session "$@"
+setup_runtime
+
+export WLR_HEADLESS_OUTPUTS=1
+cat > "$WORK/config" <<EOF
+xwayland disable
+output HEADLESS-1 mode --custom 1280x800
+EOF
+start_sway "$WORK/config"
+for socket in "$XDG_RUNTIME_DIR"/wayland-*; do
+	case "$socket" in *.lock) continue ;; esac
+	export WAYLAND_DISPLAY="${socket##*/}"
+done
+
+# A window that writes what is typed into it to $WORK/typed
+foot --app-id typing sh -c "stty -echo; exec cat > '$WORK/typed'" > /dev/null 2>&1 &
+i=0
+until swaymsg -t get_tree -r | jq -e \
+		'.. | objects | select(.app_id? == "typing" and .focused)' > /dev/null; do
+	i=$((i + 1))
+	[ "$i" -le 50 ] || fail "the foot window did not appear"
+	sleep 0.2
+done
+
+# nag NAME ARGS...: show swaynag with the buttons Yes and No in the
+# background. Yes writes NAME-yes, No writes NAME-no.
+nag() {
+	name=$1
+	shift
+	swaynag -m "Log out?" \
+		-Z Yes "touch '$WORK/$name-yes'" -Z No "touch '$WORK/$name-no'" \
+		"$@" > /dev/null 2>&1 &
+	NAG_PID=$!
+	# sway's IPC does not list layer surfaces: give the bar time to map
+	sleep 2
+	kill -0 "$NAG_PID" 2>/dev/null || fail "$name: swaynag did not start"
+}
+
+# keys KEY...: press the keys, after a warm-up key (the first key of a new
+# virtual keyboard can be lost)
+keys() {
+	args="-k Shift_L -s 300"
+	for key in "$@"; do
+		args="$args -k $key -s 100"
+	done
+	# shellcheck disable=SC2086
+	wtype $args
+}
+
+# ended NAME STATUS: swaynag exited with STATUS within 5 seconds
+ended() {
+	i=0
+	while kill -0 "$NAG_PID" 2>/dev/null; do
+		i=$((i + 1))
+		[ "$i" -le 25 ] || fail "$1: swaynag is still shown"
+		sleep 0.2
+	done
+	status=0
+	wait "$NAG_PID" || status=$?
+	[ "$status" = "$2" ] || fail "$1: swaynag exited with $status, expected $2"
+}
+
+# Without the option, Return reaches the window and swaynag stays.
+nag default
+wtype -k Shift_L -s 300 "typed
+"
+i=0
+until grep -q typed "$WORK/typed" 2>/dev/null; do
+	i=$((i + 1))
+	[ "$i" -le 25 ] || fail "default: typing did not reach the window"
+	sleep 0.2
+done
+sleep 1
+kill -0 "$NAG_PID" 2>/dev/null || fail "default: swaynag closed"
+[ ! -e "$WORK/default-yes" ] || fail "default: a key pressed Yes"
+kill "$NAG_PID"
+wait "$NAG_PID" 2>/dev/null || true
+echo "default: keys reach the window"
+
+# Return presses the first action button, and nothing reaches the window.
+: > "$WORK/typed"
+nag return --keyboard-control yes
+wtype -k Shift_L -s 300 "x" -s 100 -k Return
+ended return 0
+[ -e "$WORK/return-yes" ] || fail "return: Yes was not pressed"
+[ ! -e "$WORK/return-no" ] || fail "return: No was pressed"
+sleep 0.5
+[ ! -s "$WORK/typed" ] || fail "return: keys reached the window: $(cat "$WORK/typed")"
+echo "return: presses Yes, the window gets nothing"
+
+# Left moves to No (the buttons read No, Yes, X from left to right).
+nag left --keyboard-control yes
+keys Left Return
+ended left 0
+[ -e "$WORK/left-no" ] && [ ! -e "$WORK/left-yes" ] || fail "left: No was not the only button pressed"
+echo "left: presses No"
+
+# Tab moves to the dismiss button, which closes without running anything.
+nag tab --keyboard-control yes
+keys Tab space
+ended tab 0
+[ ! -e "$WORK/tab-yes" ] && [ ! -e "$WORK/tab-no" ] || fail "tab: an action ran"
+echo "tab: dismisses"
+
+# Escape dismisses with status 0.
+nag escape --keyboard-control yes
+keys Escape
+ended escape 0
+[ ! -e "$WORK/escape-yes" ] && [ ! -e "$WORK/escape-no" ] || fail "escape: an action ran"
+echo "escape: dismisses"
+
+# Only yes and no are accepted.
+status=0
+swaynag -m "Log out?" --keyboard-control maybe > /dev/null 2>&1 || status=$?
+[ "$status" = 1 ] || fail "invalid value: exit status $status, expected 1"
+echo "invalid value: exit status 1"
+
+echo "PASS: swaynag-keyboard-control"
