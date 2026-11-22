@@ -59,3 +59,11 @@ Restrictions: allow-stderr
 Tests: move-direction-ppt
 Depends: sway-regolith, dbus, jq, foot, fonts-dejavu-core
 Restrictions: allow-stderr
+
+Tests: output-mirroring
+Depends: sway-regolith, dbus, jq, grim, python3, wayland-utils
+Restrictions: allow-stderr
+
+Tests: output-mirroring-manager
+Depends: sway-regolith, dbus, jq, wlr-randr
+Restrictions: allow-stderr

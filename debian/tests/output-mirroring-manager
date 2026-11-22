@@ -1,0 +1,85 @@
+#!/bin/sh
+# 24-output-mirroring-manager: an output management client (wlr-randr) and
+# a headless sway with two outputs, the second one mirroring the first.
+set -eu
+. debian/tests/lib-headless.sh
+in_dbus_session "$@"
+setup_runtime
+
+cat > "$WORK/config" <<EOF2
+xwayland disable
+output HEADLESS-1 mode 1024x768 position 0 0
+output HEADLESS-2 mode 800x600 position 1024 0 mirror HEADLESS-1
+EOF2
+export WLR_HEADLESS_OUTPUTS=2
+start_sway "$WORK/config"
+for socket in "$XDG_RUNTIME_DIR"/wayland-*; do
+	case "$socket" in *.lock) continue ;; esac
+	export WAYLAND_DISPLAY="$socket"
+done
+
+# wait_for DESCRIPTION COMMAND...: retry COMMAND for up to 10 s.
+wait_for() {
+	description=$1
+	shift
+	i=0
+	until "$@" > /dev/null 2>&1; do
+		i=$((i + 1))
+		[ "$i" -le 50 ] || fail "$description"
+		sleep 0.2
+	done
+}
+
+# output_is NAME JQ: get_outputs has an output NAME for which JQ holds.
+output_is() {
+	swaymsg -t get_outputs -r |
+		jq -e --arg name "$1" ".[] | select(.name == \$name) | $2"
+}
+
+# head_is NAME JQ: wlr-randr reports a head NAME for which JQ holds.
+head_is() {
+	wlr-randr --json |
+		jq -e --arg name "$1" ".[] | select(.name == \$name) | $2"
+}
+
+mirroring() {
+	output_is HEADLESS-2 '.mirror == "HEADLESS-1" and .current_workspace == null'
+}
+
+# normal X: HEADLESS-2 is a normal output at x X.
+normal() {
+	output_is HEADLESS-2 ".mirror == null and .current_workspace != null and .rect.x == $1"
+}
+
+wait_for "HEADLESS-2 does not mirror HEADLESS-1" mirroring
+head_is HEADLESS-2 '.enabled and .position.x == 0 and .position.y == 0' > /dev/null ||
+	fail "the mirror is not reported enabled at its source's position"
+echo "reporting: the mirror is an enabled head at its source's position"
+
+wlr-randr --output HEADLESS-1 --pos 0,0
+sleep 1
+mirroring > /dev/null || fail "applying the reported heads unchanged ended mirroring"
+wlr-randr --output HEADLESS-2 --scale 2
+wait_for "the mirror's scale was not applied" head_is HEADLESS-2 '.scale == 2'
+mirroring > /dev/null || fail "changing the mirror's scale ended mirroring"
+echo "unchanged and scale-only configurations keep mirroring"
+
+wlr-randr --output HEADLESS-2 --pos 1500,0
+wait_for "placing the mirror elsewhere did not make it a normal output" normal 1500
+head_is HEADLESS-2 '.position.x == 1500' > /dev/null ||
+	fail "the suspended mirror is not reported at its own position"
+swaymsg create_output > /dev/null
+wait_for "create_output did not add an output" output_is HEADLESS-3 '.active'
+sleep 1
+normal 1500 > /dev/null || fail "another output's arrival resumed mirroring"
+echo "suspension: the mirror placed elsewhere is a normal output, also after a hotplug"
+
+wlr-randr --output HEADLESS-2 --pos 0,0
+wait_for "placing the mirror back at its source did not resume mirroring" mirroring
+echo "resumption: the mirror placed back at its source mirrors again"
+
+swaymsg output HEADLESS-2 mirror off > /dev/null
+wait_for "after mirror off, HEADLESS-2 is not at the position stored for it" normal 1500
+echo "mirror off: the position sent while mirroring was not stored"
+
+echo "PASS: output-mirroring-manager"
