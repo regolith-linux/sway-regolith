@@ -63,3 +63,7 @@ Restrictions: allow-stderr
 Tests: output-mirroring
 Depends: sway-regolith, dbus, jq, grim, python3, wayland-utils
 Restrictions: allow-stderr
+
+Tests: output-mirroring-manager
+Depends: sway-regolith, dbus, jq, wlr-randr
+Restrictions: allow-stderr
