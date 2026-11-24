@@ -3,3 +3,4 @@
 03-disable-wallpaper
 04-dbus-tray
 05-remove-config
+06-dbus-tray-fix-crash-and-update-storm.patch
