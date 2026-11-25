@@ -1,0 +1,25 @@
+#!/bin/sh
+# 13-a11y-keyboard-monitor: sway provides org.freedesktop.a11y.KeyboardMonitor
+# on the session bus. Keys are reported to the screen reader, and a key it
+# grabs does not run its binding.
+set -eu
+. debian/tests/lib-headless.sh
+in_dbus_session "$@"
+setup_runtime
+
+cat > "$WORK/config" <<EOF2
+bindsym F5 exec touch $WORK/F5
+bindsym F6 exec touch $WORK/F6
+EOF2
+start_sway "$WORK/config"
+
+for socket in "$XDG_RUNTIME_DIR"/wayland-*; do
+	case "$socket" in *.lock) continue ;; esac
+	export WAYLAND_DISPLAY="${socket##*/}"
+done
+
+if ! python3 debian/tests/a11y-keyboard-monitor.py "$WORK"; then
+	cat "$WORK/sway.log"
+	fail "keyboard monitor checks failed"
+fi
+echo "PASS: a11y-keyboard-monitor"
