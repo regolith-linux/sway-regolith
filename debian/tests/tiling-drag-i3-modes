@@ -1,0 +1,18 @@
+#!/bin/sh
+# 25-tiling-drag-i3-modes: tiled windows drag like in i3 4.25.1. A drop on
+# the middle of a window puts the dragged one after it, Shift held at the
+# press swaps them, modifier drags keep the focus where it was (across
+# outputs too), and the tiling_drag modes and swap_modifier work at run time.
+set -eu
+. debian/tests/lib-headless.sh
+in_dbus_session "$@"
+setup_runtime
+
+if ! python3 debian/tests/tiling-drag-i3-modes.py "$WORK"; then
+	for log in "$WORK"/s*/sway.log; do
+		echo "== $log"
+		tail -n 20 "$log"
+	done
+	fail "tiling drag checks failed"
+fi
+echo "PASS: tiling-drag-i3-modes"
