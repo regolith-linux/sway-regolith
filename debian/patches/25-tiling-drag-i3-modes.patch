@@ -1,0 +1,422 @@
+Description: Drag tiled windows like i3: tiling_drag modes, insert, swap_modifier
+ Regolith runs i3 and sway from one configuration. i3's tiling_drag takes
+ a choice of drag styles, and its default config ships "tiling_drag
+ modifier titlebar"; sway rejected that line (a configuration error at
+ every login) and read "tiling_drag modifier" or "tiling_drag titlebar"
+ as off. sway now accepts off, modifier, titlebar and both styles in
+ either order; the boolean words keep working, toggle switches between
+ off and both styles, and any other argument is an error.
+ .
+ A tiled window dropped on the middle of another one now goes right
+ after it in its parent (a new tab or stack entry in tabbed and stacked
+ containers), as in i3. The two swap only if the swap modifier was held
+ when the drag began: "tiling_drag swap_modifier <modifier>" takes the
+ names floating_modifier takes, + combinations as i3 writes them, or
+ none; Shift is the default. A swap reports a window move event for each
+ window.
+ .
+ A modifier drag no longer focuses the dragged window, as in i3, and a
+ swap keeps the focus where it was, also when the two windows are on
+ different outputs. A title bar drag focuses the window like a click.
+ With only title bar drags enabled, holding the floating modifier does
+ not skip tiling_drag_threshold.
+ .
+ Applied on top of 12-i3-tree-moves: the swap keeps the focused node in
+ its focus path instead of moving the focus to the window that takes its
+ place.
+Author: rego-port-bot <339843353+rego-port-bot@users.noreply.github.com>
+Bug: https://github.com/swaywm/sway/issues/8641
+Bug: https://github.com/swaywm/sway/issues/9030
+Forwarded: https://github.com/swaywm/sway/compare/master...cfsmp3:sway-regolith:ubuntu/tiling-drag-i3-modes
+Last-Update: 2026-11-25
+---
+--- a/include/sway/config.h
++++ b/include/sway/config.h
+@@ -463,6 +463,14 @@ enum focus_follows_mouse_mode {
+ 	FOLLOWS_ALWAYS,
+ };
+ 
++enum tiling_drag_mode {
++	TILING_DRAG_OFF = 0,
++	TILING_DRAG_MODIFIER = 1 << 0,
++	TILING_DRAG_TITLEBAR = 1 << 1,
++	TILING_DRAG_MODIFIER_OR_TITLEBAR =
++		TILING_DRAG_MODIFIER | TILING_DRAG_TITLEBAR,
++};
++
+ enum focus_wrapping_mode {
+ 	WRAP_NO,
+ 	WRAP_YES,
+@@ -551,8 +559,9 @@ struct sway_config {
+ 	enum alignment title_align;
+ 	bool primary_selection;
+ 
+-	bool tiling_drag;
++	enum tiling_drag_mode tiling_drag;
+ 	int tiling_drag_threshold;
++	uint32_t tiling_drag_swap_mod;
+ 
+ 	enum smart_gaps_mode smart_gaps;
+ 	int gaps_inner;
+--- a/include/sway/tree/container.h
++++ b/include/sway/tree/container.h
+@@ -311,6 +311,13 @@ void container_replace(struct sway_conta
+ 
+ void container_swap(struct sway_container *con1, struct sway_container *con2);
+ 
++/**
++ * Like container_swap, but the focus stays on the node that has it, even if
++ * that node moves to another workspace.
++ */
++void container_swap_keep_focus(struct sway_container *con1,
++		struct sway_container *con2);
++
+ struct sway_container *container_split(struct sway_container *child,
+ 		enum sway_container_layout layout);
+ 
+--- a/sway/commands/tiling_drag.c
++++ b/sway/commands/tiling_drag.c
+@@ -1,13 +1,134 @@
++#include <string.h>
++#include <strings.h>
+ #include "sway/commands.h"
+-#include "util.h"
++#include "sway/config.h"
++#include "sway/input/keyboard.h"
++
++static const char expected_syntax[] = "Expected 'tiling_drag "
++	"enable|disable|toggle|off|modifier|titlebar|modifier titlebar' or "
++	"'tiling_drag swap_modifier <modifier>[+<modifier>...]'";
++
++static bool parse_style(const char *word, enum tiling_drag_mode *style) {
++	if (strcasecmp(word, "modifier") == 0) {
++		*style = TILING_DRAG_MODIFIER;
++	} else if (strcasecmp(word, "titlebar") == 0) {
++		*style = TILING_DRAG_TITLEBAR;
++	} else {
++		return false;
++	}
++	return true;
++}
++
++static bool word_in(const char *word, const char *const *list) {
++	for (; *list; ++list) {
++		if (strcasecmp(word, *list) == 0) {
++			return true;
++		}
++	}
++	return false;
++}
++
++static bool parse_single_word(const char *word, enum tiling_drag_mode *mode) {
++	// The words parse_boolean() treats as true, and i3's words for off
++	static const char *const on_words[] = {
++		"1", "yes", "on", "true", "enable", "enabled", "active", NULL,
++	};
++	static const char *const off_words[] = {
++		"0", "no", "off", "false", "disable", "inactive", NULL,
++	};
++
++	if (parse_style(word, mode)) {
++		return true;
++	}
++	if (word_in(word, on_words)) {
++		*mode = TILING_DRAG_MODIFIER_OR_TITLEBAR;
++	} else if (word_in(word, off_words)) {
++		*mode = TILING_DRAG_OFF;
++	} else if (strcasecmp(word, "toggle") == 0) {
++		*mode = config->tiling_drag == TILING_DRAG_OFF ?
++			TILING_DRAG_MODIFIER_OR_TITLEBAR : TILING_DRAG_OFF;
++	} else {
++		return false;
++	}
++	return true;
++}
++
++// Parses a modifier name or a '+'-joined combination of names, as i3 spells
++// them (e.g. 'Mod1+Shift'). Returns 0 if any part is not a modifier name.
++static uint32_t parse_modifier_combination(const char *spec) {
++	uint32_t mask = 0;
++	const char *part = spec;
++	while (true) {
++		const char *end = strchr(part, '+');
++		size_t len = end ? (size_t)(end - part) : strlen(part);
++		char name[32];
++		if (len == 0 || len >= sizeof(name)) {
++			return 0;
++		}
++		memcpy(name, part, len);
++		name[len] = '\0';
++		uint32_t mod = get_modifier_mask_by_name(name);
++		if (!mod) {
++			return 0;
++		}
++		mask |= mod;
++		if (!end) {
++			return mask;
++		}
++		part = end + 1;
++	}
++}
++
++static struct cmd_results *cmd_tiling_drag_swap_modifier(int argc,
++		char **argv) {
++	struct cmd_results *error = NULL;
++	if ((error = checkarg(argc, "tiling_drag swap_modifier",
++					EXPECTED_EQUAL_TO, 1))) {
++		return error;
++	}
++
++	uint32_t mod = 0;
++	if (strcasecmp(argv[0], "none") != 0) {
++		mod = parse_modifier_combination(argv[0]);
++		if (!mod) {
++			return cmd_results_new(CMD_INVALID,
++					"Invalid modifier '%s'", argv[0]);
++		}
++	}
++
++	config->tiling_drag_swap_mod = mod;
++	return cmd_results_new(CMD_SUCCESS, NULL);
++}
+ 
+ struct cmd_results *cmd_tiling_drag(int argc, char **argv) {
+ 	struct cmd_results *error = NULL;
+-	if ((error = checkarg(argc, "tiling_drag", EXPECTED_EQUAL_TO, 1))) {
++	if ((error = checkarg(argc, "tiling_drag", EXPECTED_AT_LEAST, 1))) {
+ 		return error;
+ 	}
+ 
+-	config->tiling_drag = parse_boolean(argv[0], config->tiling_drag);
++	if (strcasecmp(argv[0], "swap_modifier") == 0) {
++		return cmd_tiling_drag_swap_modifier(argc - 1, argv + 1);
++	}
++
++	if ((error = checkarg(argc, "tiling_drag", EXPECTED_AT_MOST, 2))) {
++		return error;
++	}
++
++	enum tiling_drag_mode mode;
++	if (argc == 1) {
++		if (!parse_single_word(argv[0], &mode)) {
++			return cmd_results_new(CMD_INVALID, "%s", expected_syntax);
++		}
++	} else {
++		// Both drag styles, in either order: 'modifier titlebar'
++		enum tiling_drag_mode first, second;
++		if (!parse_style(argv[0], &first) || !parse_style(argv[1], &second) ||
++				first == second) {
++			return cmd_results_new(CMD_INVALID, "%s", expected_syntax);
++		}
++		mode = first | second;
++	}
+ 
++	config->tiling_drag = mode;
+ 	return cmd_results_new(CMD_SUCCESS, NULL);
+ }
+--- a/sway/config.c
++++ b/sway/config.c
+@@ -15,6 +15,7 @@
+ #include <dirent.h>
+ #include <strings.h>
+ #include <linux/input-event-codes.h>
++#include <wlr/types/wlr_keyboard.h>
+ #include <wlr/types/wlr_output.h>
+ #include "sway/input/input-manager.h"
+ #include "sway/input/seat.h"
+@@ -280,8 +281,9 @@ static void config_defaults(struct sway_
+ 	config->reading = false;
+ 	config->show_marks = true;
+ 	config->title_align = ALIGN_LEFT;
+-	config->tiling_drag = true;
++	config->tiling_drag = TILING_DRAG_MODIFIER_OR_TITLEBAR;
+ 	config->tiling_drag_threshold = 9;
++	config->tiling_drag_swap_mod = WLR_MODIFIER_SHIFT;
+ 	config->primary_selection = true;
+ 
+ 	config->smart_gaps = SMART_GAPS_OFF;
+--- a/sway/input/seatop_default.c
++++ b/sway/input/seatop_default.c
+@@ -259,7 +259,8 @@ static void handle_tablet_tool_tip(struc
+ 		}
+ 
+ 		// Handle moving a tiling container
+-		if (config->tiling_drag && mod_pressed && !is_floating_or_child &&
++		if ((config->tiling_drag & TILING_DRAG_MODIFIER) && mod_pressed &&
++				!is_floating_or_child &&
+ 				cont->pending.fullscreen_mode == FULLSCREEN_NONE) {
+ 			seatop_begin_move_tiling(seat, cont);
+ 			return;
+@@ -434,6 +435,15 @@ static void handle_button(struct sway_se
+ 		return;
+ 	}
+ 
++	// Handle moving a tiling container via mod. Like i3, this doesn't change
++	// the focus.
++	if ((config->tiling_drag & TILING_DRAG_MODIFIER) && mod_move_btn_pressed &&
++			state == WL_POINTER_BUTTON_STATE_PRESSED && !is_floating_or_child &&
++			cont && cont->pending.fullscreen_mode == FULLSCREEN_NONE) {
++		seatop_begin_move_tiling(seat, cont);
++		return;
++	}
++
+ 	// Handle changing focus when clicking on a container
+ 	if (cont && state == WL_POINTER_BUTTON_STATE_PRESSED) {
+ 		// Default case: focus the container that was just clicked.
+@@ -486,12 +496,11 @@ static void handle_button(struct sway_se
+ 		}
+ 	}
+ 
+-	// Handle moving a tiling container
+-	if (config->tiling_drag && (mod_move_btn_pressed || titlebar_left_btn_pressed) &&
++	// Handle moving a tiling container by its title bar
++	if ((config->tiling_drag & TILING_DRAG_TITLEBAR) && titlebar_left_btn_pressed &&
+ 			state == WL_POINTER_BUTTON_STATE_PRESSED && !is_floating_or_child &&
+ 			cont && cont->pending.fullscreen_mode == FULLSCREEN_NONE) {
+-		// If moving a container by its title bar, use a threshold for the drag
+-		if (!mod_pressed && config->tiling_drag_threshold > 0) {
++		if (config->tiling_drag_threshold > 0) {
+ 			seatop_begin_move_tiling_threshold(seat, cont);
+ 		} else {
+ 			seatop_begin_move_tiling(seat, cont);
+--- a/sway/input/seatop_move_tiling.c
++++ b/sway/input/seatop_move_tiling.c
+@@ -1,5 +1,6 @@
+ #include <limits.h>
+ #include <wlr/types/wlr_cursor.h>
++#include <wlr/types/wlr_keyboard.h>
+ #include <wlr/util/edges.h>
+ #include "sway/desktop/transaction.h"
+ #include "sway/input/cursor.h"
+@@ -26,6 +27,7 @@ struct seatop_move_tiling_event {
+ 	bool threshold_reached;
+ 	bool split_target;
+ 	bool insert_after_target;
++	bool swap; // swap_modifier held when the drag began
+ 	struct wlr_scene_rect *indicator_rect;
+ };
+ 
+@@ -335,8 +337,10 @@ static void finalize_move(struct sway_se
+ 		target_node->sway_workspace : target_node->sway_container->pending.workspace;
+ 	enum wlr_edges edge = e->target_edge;
+ 	int after = edge != WLR_EDGE_TOP && edge != WLR_EDGE_LEFT;
++	// Dropping onto the middle of a view puts the container after it, or
++	// swaps the two if the swap modifier was held when the drag began.
+ 	bool swap = edge == WLR_EDGE_NONE && target_node->type == N_CONTAINER &&
+-		!e->split_target;
++		!e->split_target && e->swap;
+ 
+ 	if (!swap) {
+ 		container_detach(con);
+@@ -357,7 +361,9 @@ static void finalize_move(struct sway_se
+ 		// Moving container before/after another
+ 		struct sway_container *target = target_node->sway_container;
+ 		if (swap) {
+-			container_swap(target_node->sway_container, con);
++			container_swap_keep_focus(target, con);
++			ipc_event_window(con, "move");
++			ipc_event_window(target, "move");
+ 		} else {
+ 			enum sway_container_layout layout = container_parent_layout(target);
+ 			if (edge && !is_parallel(layout, edge)) {
+@@ -464,6 +470,11 @@ void seatop_begin_move_tiling_threshold(
+ 	e->ref_lx = seat->cursor->cursor->x;
+ 	e->ref_ly = seat->cursor->cursor->y;
+ 
++	struct wlr_keyboard *keyboard = wlr_seat_get_keyboard(seat->wlr_seat);
++	uint32_t modifiers = keyboard ? wlr_keyboard_get_modifiers(keyboard) : 0;
++	uint32_t swap_mod = config->tiling_drag_swap_mod;
++	e->swap = swap_mod && (modifiers & swap_mod) == swap_mod;
++
+ 	seat->seatop_impl = &seatop_impl;
+ 	seat->seatop_data = e;
+ 
+--- a/sway/sway.5.scd
++++ b/sway/sway.5.scd
+@@ -878,17 +878,38 @@ The default colors are:
+ 	Adjusts the opacity of the window between 0 (completely transparent) and
+ 	1 (completely opaque). If the operation is omitted, _set_ will be used.
+ 
+-*tiling_drag*  enable|disable|toggle
+-	Sets whether or not tiling containers can be dragged with the mouse. If
+-	_enabled_ (default), the _floating_mod_ can be used to drag tiling, as well
+-	as floating, containers. Using the left mouse button on title bars without
+-	the _floating_mod_ will also allow the container to be dragged. _toggle_
+-	should not be used in the config file.
++*tiling_drag* off|modifier|titlebar|modifier titlebar
++	Sets how tiling containers can be dragged with the mouse. With _modifier_,
++	the _floating_mod_ can be held while pressing the move button on a tiling
++	container to drag it; this does not change focus. With _titlebar_, the left
++	mouse button can be pressed on a title bar, without the _floating_mod_, to
++	focus the container and drag it. _modifier titlebar_ (or _titlebar
++	modifier_) enables both and is the default; _off_ disables dragging tiling
++	containers. _enable_, _enabled_, _yes_, _on_, _true_, _active_ and _1_ are
++	aliases for _modifier titlebar_; _disable_, _no_, _false_, _inactive_ and
++	_0_ are aliases for _off_.
++
++	Dropping a container onto the middle of a window places it after that
++	window. If the _swap_modifier_ was held when the drag started, the two
++	containers are swapped instead, and the focus stays where it is. Dropping
++	it close to the edge of a window places it beside that window.
++
++*tiling_drag* toggle
++	Switches between _off_ and _modifier titlebar_. _toggle_ should not be
++	used in the config file.
++
++*tiling_drag* swap_modifier <modifier>[+<modifier>...]|none
++	Sets the modifier which, when held at the start of a drag, makes dropping
++	a tiling container onto the middle of a window swap the two containers.
++	Accepts the same modifier names as *floating_modifier*, or several of them
++	joined with _+_ (for example _Mod1+Shift_), in which case all of them must
++	be held. _none_ disables swapping. The default is _Shift_. This does not
++	change which drag styles are enabled.
+ 
+ *tiling_drag_threshold* <threshold>
+ 	Sets the threshold that must be exceeded for a container to be dragged by
+-	its titlebar. This has no effect if _floating_mod_ is used or if
+-	_tiling_drag_ is set to _disable_.  Once the threshold has been exceeded
++	its titlebar. This has no effect on drags started with the _floating_mod_
++	(see *tiling_drag* _modifier_).  Once the threshold has been exceeded
+ 	once, the drag starts and the cursor can come back inside the threshold
+ 	without stopping the drag.  _threshold_ is multiplied by the scale of the
+ 	output that the cursor on.  The default is 9.
+--- a/sway/tree/container.c
++++ b/sway/tree/container.c
+@@ -1909,7 +1909,8 @@ static void swap_focus_order(struct sway
+ 	list_free(order);
+ }
+ 
+-void container_swap(struct sway_container *con1, struct sway_container *con2) {
++static void swap(struct sway_container *con1, struct sway_container *con2,
++		bool keep_focus) {
+ 	if (!sway_assert(con1 && con2, "Cannot swap with nothing")) {
+ 		return;
+ 	}
+@@ -1962,10 +1963,11 @@ void container_swap(struct sway_containe
+ 
+ 	// Like i3: when both containers are on the focused workspace, the focused
+ 	// node keeps the focus. Otherwise, when the focus is in one of them, it
+-	// goes to the container that takes that one's place.
++	// goes to the container that takes that one's place, unless the caller
++	// wants the focus kept.
+ 	struct sway_node *restore_focus = NULL;
+-	if (con1->pending.workspace == con2->pending.workspace &&
+-			con1->pending.workspace == focus_ws) {
++	if (keep_focus || (con1->pending.workspace == con2->pending.workspace &&
++			con1->pending.workspace == focus_ws)) {
+ 		restore_focus = focus;
+ 	} else if (node_is_or_inside(focus, con1)) {
+ 		restore_focus = &con2->node;
+@@ -2042,3 +2044,12 @@ void container_swap(struct sway_containe
+ 		container_set_fullscreen(con1, fs2);
+ 	}
+ }
++
++void container_swap(struct sway_container *con1, struct sway_container *con2) {
++	swap(con1, con2, false);
++}
++
++void container_swap_keep_focus(struct sway_container *con1,
++		struct sway_container *con2) {
++	swap(con1, con2, true);
++}
