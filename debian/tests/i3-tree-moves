@@ -1,0 +1,158 @@
+#!/bin/sh
+# 12-i3-tree-moves: move and swap build the same container trees and focus
+# orders as i3 4.25.1, the focus order leads to the focused window, and the
+# window focused by a swap gets the keyboard.
+set -eu
+. debian/tests/lib-headless.sh
+in_dbus_session "$@"
+setup_runtime
+
+JQ_DEFS='
+def L: {"splith": "H", "splitv": "V", "tabbed": "T", "stacked": "S"}[.layout];
+def star: if .focused then "*" else "" end;
+def rep: if .app_id then .app_id + star
+	else L + "[" + ([.nodes[] | rep] | join(" ")) + "]" + star end;
+def lab: if .app_id then .app_id
+	else L + "(" + ([.nodes[] | lab] | join(",")) + ")" end;
+def order: [recurse(.nodes[]) | select(.nodes | length > 0) | . as $c
+	| lab + ":" + ([.focus[] as $f | $c.nodes[] | select(.id == $f) | lab]
+		| join(" > "))] | join("; ");
+def ws($n): first(.. | objects | select(.type? == "workspace" and .name == $n));
+def follow: if .focused then true
+	else (.focus[0] // -1) as $f | [(.nodes + .floating_nodes)[] | select(.id == $f)]
+		| if length == 1 then .[0] | follow else false end end;
+def named(f): [$ARGS.positional[] as $n
+	| (if ($ARGS.positional | length) > 1 then $n + "=" else "" end) + (ws($n) | f)];
+'
+
+# new_session OUTPUTS POSITION: restart headless sway with fresh state;
+# POSITION places HEADLESS-2 ("right" or "below").
+new_session() {
+	if [ -n "${SWAY_PID:-}" ]; then
+		kill "$SWAY_PID" 2>/dev/null || true
+		wait "$SWAY_PID" 2>/dev/null || true
+	fi
+	SESSION=$((${SESSION:-0} + 1))
+	export XDG_RUNTIME_DIR="$WORK/run-$SESSION"
+	mkdir -m 700 "$XDG_RUNTIME_DIR"
+	export WLR_HEADLESS_OUTPUTS="$1"
+	unset SWAYSOCK WAYLAND_DISPLAY
+	cat > "$WORK/config" <<-EOF
+	xwayland disable
+	default_border normal
+	focus_follows_mouse no
+	mouse_warping none
+	output HEADLESS-1 mode --custom 1280x800 position 0 0
+	EOF
+	case "$2" in
+	right) echo "output HEADLESS-2 mode --custom 1280x800 position 1280 0" >> "$WORK/config" ;;
+	below) echo "output HEADLESS-2 mode --custom 1280x800 position 0 800" >> "$WORK/config" ;;
+	esac
+	if [ "$1" = 2 ]; then
+		printf '%s\n' "workspace L output HEADLESS-1" \
+			"workspace R output HEADLESS-2" >> "$WORK/config"
+	fi
+	start_sway "$WORK/config"
+	for socket in "$XDG_RUNTIME_DIR"/wayland-*; do
+		case "$socket" in *.lock) continue ;; esac
+		export WAYLAND_DISPLAY="${socket##*/}"
+	done
+	if [ "$1" = 2 ]; then cmd "workspace R"; else cmd "workspace 1"; fi
+}
+
+cmd() {
+	swaymsg "$1" > /dev/null || fail "command failed: $1"
+}
+
+# open NAME...: open foot windows whose app_id is NAME. Each one writes what
+# is typed into it to $WORK/typed-NAME.
+open() {
+	for name in "$@"; do
+		foot --app-id "$name" sh -c "stty -echo; exec cat > '$WORK/typed-$name'" \
+			> /dev/null 2>&1 &
+		i=0
+		until swaymsg -t get_tree -r | jq -e --arg n "$name" \
+				'.. | objects | select(.app_id? == $n and .focused)' > /dev/null; do
+			i=$((i + 1))
+			[ "$i" -le 50 ] || fail "window $name did not appear"
+			sleep 0.2
+		done
+	done
+}
+
+focus() {
+	cmd "[app_id=\"^$1\$\"] focus"
+}
+
+con_id() {
+	swaymsg -t get_tree -r | jq -r --arg n "$1" '.. | objects | select(.app_id? == $n) | .id'
+}
+
+# check NAME TREE FOCUS WORKSPACE...: compare the workspaces' trees and focus
+# orders with the expected ones, and check the focus path.
+check() {
+	name=$1 want_tree=$2 want_focus=$3
+	shift 3
+	tree=$(swaymsg -t get_tree -r)
+	got_tree=$(echo "$tree" | jq -r "$JQ_DEFS"' named(rep) | join(" ")' --args "$@")
+	got_focus=$(echo "$tree" | jq -r "$JQ_DEFS"' named(order) | join(" | ")' --args "$@")
+	echo "$name: $got_tree, focus $got_focus"
+	[ "$got_tree" = "$want_tree" ] || fail "$name: expected $want_tree"
+	[ "$got_focus" = "$want_focus" ] || fail "$name: expected focus $want_focus"
+	echo "$tree" | jq -e "$JQ_DEFS"' follow' > /dev/null ||
+		fail "$name: the focus order does not lead to the focused window"
+}
+
+# Moving into a neighbour descends to the view nearest to where the window
+# comes from and goes next to it.
+new_session 1 none
+open A B; focus A; cmd "split v"; cmd "layout stacking"; open C
+focus B; cmd "split v"; cmd "layout stacking"; focus C
+cmd "move right"
+check into-stack 'H[S[A] S[B C*]]' \
+	'H(S(A),S(B,C)):S(B,C) > S(A); S(A):A; S(B,C):C > B' 1
+
+# A redundant pair is removed with its children kept in order.
+new_session 1 none
+open w1 s; cmd "split v"; open x; focus s; cmd "split h"; open t u; focus t; focus x
+cmd "move up"
+check squash 'H[w1 s t x* u]' 'H(w1,s,t,x,u):x > w1 > s > t > u' 1
+
+# Moving out of a container goes next to it.
+new_session 1 none
+open a b; cmd "split v"; open c; focus b
+cmd "move right"
+check out-of-container 'H[a V[c] b*]' 'H(a,V(c),b):b > V(c) > a; V(c):c' 1
+
+# Moving onto the adjacent output makes the window the workspace's first child.
+new_session 2 right
+open p; cmd "split v"; open q; cmd "workspace L"; open a X; focus X
+cmd "move right"
+check to-output 'L=H[a] R=V[X* p q]' 'L=H(a):a | R=V(X,p,q):X > q > p' L R
+
+# Swap exchanges the places in the focus order too.
+new_session 1 none
+open a c; focus a; cmd "split h"; cmd "layout tabbed"; open b; focus c
+cmd "swap container with con_id $(con_id b)"
+check swap 'H[T[a c*] b]' 'H(T(a,c),b):T(a,c) > b; T(a,c):c > a' 1
+
+# Swapping the focused window with one on a hidden workspace focuses the
+# window that takes its place, keyboard included.
+new_session 1 none
+cmd "workspace 2"; open a; cmd "split h"; cmd "layout tabbed"; open b c; focus b
+cmd "workspace 1"; open X Y Z; focus X
+cmd "swap container with con_id $(con_id b)"
+check swap-hidden '1=H[b* Y Z] 2=H[T[a X c]]' \
+	'1=H(b,Y,Z):b > Z > Y | 2=H(T(a,X,c)):T(a,X,c); T(a,X,c):X > c > a' 1 2
+wtype -s 300 "typed
+"
+i=0
+until grep -q typed "$WORK/typed-b" 2>/dev/null; do
+	i=$((i + 1))
+	[ "$i" -le 25 ] || fail "swap-hidden: the keyboard did not follow the focus to b"
+	sleep 0.2
+done
+! grep -q typed "$WORK/typed-X" || fail "swap-hidden: X still got the keyboard"
+echo "swap-hidden: typing reaches b"
+
+echo "PASS: i3-tree-moves"

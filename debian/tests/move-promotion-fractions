@@ -1,0 +1,100 @@
+#!/bin/sh
+# 15-move-promotion-fractions: a container promoted out of its parent by a
+# directional move gets the same share as its new siblings, as in i3 4.25.1
+# (sway kept its old fraction: 274 274 320 412 px on a 1280 px output).
+set -eu
+. debian/tests/lib-headless.sh
+in_dbus_session "$@"
+setup_runtime
+
+JQ_DEFS='
+def L: {"splith": "H", "splitv": "V", "tabbed": "T", "stacked": "S"}[.layout];
+def star: if .focused then "*" else "" end;
+def rep: if .app_id then .app_id + star
+	else L + "[" + ([.nodes[] | rep] | join(" ")) + "]" + star end;
+def ws($n): first(.. | objects | select(.type? == "workspace" and .name == $n));
+def focused_name: first(.. | objects | select(.focused? == true)
+	| if .app_id then .app_id else .type + " " + .name end);
+'
+
+# new_session OUTPUTS: restart headless sway with fresh state and OUTPUTS
+# 1280x800 outputs side by side.
+new_session() {
+	if [ -n "${SWAY_PID:-}" ]; then
+		kill "$SWAY_PID" 2>/dev/null || true
+		wait "$SWAY_PID" 2>/dev/null || true
+	fi
+	SESSION=$((${SESSION:-0} + 1))
+	export XDG_RUNTIME_DIR="$WORK/run-$SESSION"
+	mkdir -m 700 "$XDG_RUNTIME_DIR"
+	export WLR_HEADLESS_OUTPUTS="$1"
+	unset SWAYSOCK WAYLAND_DISPLAY
+	cat > "$WORK/config" <<-EOF
+	xwayland disable
+	default_border normal
+	focus_follows_mouse no
+	mouse_warping none
+	output HEADLESS-1 mode --custom 1280x800 position 0 0
+	output HEADLESS-2 mode --custom 1280x800 position 1280 0
+	workspace 1 output HEADLESS-1
+	workspace 2 output HEADLESS-2
+	EOF
+	[ "$1" = 2 ] || sed -i '/HEADLESS-2/d' "$WORK/config"
+	start_sway "$WORK/config"
+	for socket in "$XDG_RUNTIME_DIR"/wayland-*; do
+		case "$socket" in *.lock) continue ;; esac
+		export WAYLAND_DISPLAY="${socket##*/}"
+	done
+	cmd "workspace 1"
+}
+
+cmd() {
+	swaymsg "$1" > /dev/null || fail "command failed: $1"
+}
+
+# open NAME...: open foot windows whose app_id is NAME. Each one writes what
+# is typed into it to $WORK/typed-NAME.
+open() {
+	for name in "$@"; do
+		foot --app-id "$name" sh -c "stty -echo; exec cat > '$WORK/typed-$name'" \
+			> /dev/null 2>&1 &
+		i=0
+		until swaymsg -t get_tree -r | jq -e --arg n "$name" \
+				'.. | objects | select(.app_id? == $n and .focused)' > /dev/null; do
+			i=$((i + 1))
+			[ "$i" -le 50 ] || fail "window $name did not appear"
+			sleep 0.2
+		done
+	done
+}
+
+focus() {
+	cmd "[app_id=\"^$1\$\"] focus"
+}
+
+# query JQ: run a jq filter (with JQ_DEFS) on the current tree
+query() {
+	swaymsg -t get_tree -r | jq -r "$JQ_DEFS $1"
+}
+
+# expect NAME GOT WANT
+expect() {
+	echo "$1: $2"
+	[ "$2" = "$3" ] || fail "$1: expected $3"
+}
+
+# W in H[X Y H[A W]] moved right leaves H[A W] through the workspace edge.
+new_session 1
+open X Y A; cmd "split h"; open W
+cmd "move right"
+expect promote-right "$(query 'ws("1") | rep')" "H[X Y H[A] W*]"
+expect promote-right-widths "$(query '[ws("1").nodes[] | .rect.width] | join(" ")')" "320 320 320 320"
+
+# The same through the left edge.
+new_session 1
+open W X Y; focus W; cmd "split h"; open A; focus W
+cmd "move left"
+expect promote-left "$(query 'ws("1") | rep')" "H[W* H[A] X Y]"
+expect promote-left-widths "$(query '[ws("1").nodes[] | .rect.width] | join(" ")')" "320 320 320 320"
+
+echo "PASS: move-promotion-fractions"
