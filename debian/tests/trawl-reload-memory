@@ -1,0 +1,62 @@
+#!/bin/sh
+# 01-regolith-trawl: config reloads must not leak trawl proxies.
+# 200 set_from_resource directives, 50 reloads. A proxy leaked per directive
+# grows sway by several MB per reload (over 1 GB here); a fixed build stays
+# within a few MB.
+set -eu
+. debian/tests/lib-headless.sh
+in_dbus_session "$@"
+setup_runtime
+start_trawld
+
+n=200
+reloads=50
+limit_kb=32768
+
+i=1
+while [ "$i" -le "$n" ]; do
+	echo "sway_regolith.test.k$i: value$i"
+	i=$((i + 1))
+done > "$WORK/resources"
+load_resources "$WORK/resources" sway_regolith.test.k1
+
+i=1
+while [ "$i" -le "$n" ]; do
+	echo "set_from_resource \$v$i sway_regolith.test.k$i fallback"
+	i=$((i + 1))
+done > "$WORK/config"
+echo 'workspace $v1' >> "$WORK/config"
+start_sway "$WORK/config"
+swaymsg -t get_workspaces -r | jq -r '.[].name' | grep -qx value1 ||
+	fail "set_from_resource did not read the trawl values"
+
+rss() { awk '/^VmRSS:/ {print $2}' "/proc/$SWAY_PID/status"; }
+
+# swaymsg gives up after 3 s, which a reload with 200 D-Bus lookups can
+# exceed on slow (emulated) testbeds. sway handles IPC in order, so wait
+# until it answers again before the next reload.
+reload() {
+	swaymsg reload > /dev/null 2>&1 || true
+	j=0
+	until swaymsg -t get_version > /dev/null 2>&1; do
+		j=$((j + 1))
+		[ "$j" -le 60 ] && kill -0 "$SWAY_PID" 2>/dev/null || fail "sway stopped answering after reload $1"
+	done
+}
+
+# One reload first, so one-time allocations are not counted.
+reload 0
+sleep 1
+before=$(rss)
+i=1
+while [ "$i" -le "$reloads" ]; do
+	reload "$i"
+	i=$((i + 1))
+done
+sleep 1
+after=$(rss)
+growth=$((after - before))
+echo "VmRSS kB: before=$before after=$after growth=$growth ($reloads reloads, $n directives)"
+[ "$growth" -lt "$limit_kb" ] || fail "sway grew by $growth kB over $reloads reloads (limit $limit_kb kB)"
+
+echo "PASS: trawl-reload-memory"

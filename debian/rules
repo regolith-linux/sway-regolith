@@ -1,0 +1,54 @@
+#!/usr/bin/make -f
+# -*- makefile -*-
+
+export DH_VERBOSE=1
+export DH_OPTIONS=-v
+
+include /usr/share/dpkg/pkg-info.mk
+include /usr/share/dpkg/architecture.mk
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+export DEB_CFLAGS_MAINT_APPEND = -Wno-error=deprecated-declarations
+
+%:
+	dh $@
+
+# 13-a11y-keyboard-monitor: fail the build rather than ship sway without the
+# keyboard monitor that Orca needs.
+.PHONY: override_dh_auto_configure
+override_dh_auto_configure:
+	dh_auto_configure -- --libexecdir=lib -Ddefault-wallpaper=false -Da11y=enabled
+
+.PHONY: override_dh_auto_install
+override_dh_auto_install:
+	dh_auto_install --destdir=debian/tmp
+
+.PHONY: override_dh_missing
+override_dh_missing:
+	dh_missing --fail-missing
+
+.PHONY: override_dh_install
+override_dh_install:
+	if ! dh_install; then \
+		tree debian/tmp;    \
+    exit 1;             \
+	fi
+
+# 01-regolith-trawl: set_from_resource must fall back cleanly when trawl is
+# unreachable (no session bus here), with GLib criticals made fatal.
+# 10-bind-none-disables-binding: key combinations with none validate quietly.
+# 11-validate-included-configs: sway -C fails on errors in included files.
+.PHONY: override_dh_auto_test
+override_dh_auto_test:
+	dh_auto_test
+ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
+	sh debian/tests/set-from-resource-fallback.sh obj-$(DEB_HOST_GNU_TYPE)/sway/sway
+	sh debian/tests/bind-none.sh obj-$(DEB_HOST_GNU_TYPE)/sway/sway
+	sh debian/tests/validate-includes.sh obj-$(DEB_HOST_GNU_TYPE)/sway/sway
+endif
+
+.PHONY: override_dh_builddeb
+override_dh_builddeb:
+	dh_builddeb
+ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
+	sh debian/tests/no-sway-config ../sway-regolith_$(DEB_VERSION)_$(DEB_HOST_ARCH).deb
+endif

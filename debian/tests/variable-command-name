@@ -1,0 +1,29 @@
+#!/bin/sh
+# 08-variable-command-name: a config line that starts with a variable
+# holding exec or exec_always runs, as in i3.
+set -eu
+. debian/tests/lib-headless.sh
+in_dbus_session "$@"
+setup_runtime
+
+cat > "$WORK/config" <<EOF2
+set \$ex exec
+set \$exa exec_always
+\$ex touch $WORK/from-exec
+\$exa touch $WORK/from-exec-always
+EOF2
+start_sway "$WORK/config"
+
+for marker in from-exec from-exec-always; do
+	i=0
+	until [ -e "$WORK/$marker" ]; do
+		i=$((i + 1))
+		if [ "$i" -gt 50 ]; then
+			cat "$WORK/sway.log"
+			fail "config line for $marker did not run"
+		fi
+		sleep 0.2
+	done
+done
+
+echo "PASS: variable-command-name"

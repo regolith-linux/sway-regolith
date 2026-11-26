@@ -1,0 +1,1377 @@
+Description: Add keyboard accessibility options (sticky, slow, bounce and mouse keys)
+ sway has no equivalent of the X server's AccessX features, so the
+ desktop's Typing accessibility settings do nothing in the Wayland
+ session while they work in the X11 session. This adds per-keyboard
+ input options, settable in the config file and at run time with
+ swaymsg:
+ .
+   sticky_keys enabled|disabled
+   sticky_keys_two_key_off enabled|disabled
+   slow_keys <ms>                 (0 disables)
+   bounce_keys <ms>               (0 disables)
+   mouse_keys enabled|disabled
+   mouse_keys_init_delay <ms>
+   mouse_keys_accel_time <ms>
+   mouse_keys_max_speed <px/s>
+ .
+ Sticky keys latch a tapped modifier for the next key and lock it when
+ it is tapped twice; with sticky_keys_two_key_off, pressing two
+ modifiers together releases them. Slow keys deliver a press only once
+ the key has been held for the delay. Bounce keys drop a press of a key
+ that comes within the delay after its previous accepted press. Mouse
+ keys move the pointer with the keypad direction keys, accelerating
+ linearly to the maximum speed (no button emulation yet).
+ .
+ The state is kept per keyboard, so keyboards with any of these options
+ on are not grouped. With none of the options set, key events take the
+ same path as before. The options are reported by get_inputs and
+ documented in sway-input(5) and sway-ipc(7).
+Author: rego-port-bot <339843353+rego-port-bot@users.noreply.github.com>
+Forwarded: no
+Last-Update: 2026-10-27
+---
+diff --git a/include/sway/commands.h b/include/sway/commands.h
+index 6f34244..2652b9d 100644
+--- a/include/sway/commands.h
++++ b/include/sway/commands.h
+@@ -251,6 +251,7 @@ sway_cmd bar_colors_cmd_urgent_workspace;
+ 
+ sway_cmd input_cmd_seat;
+ sway_cmd input_cmd_accel_profile;
++sway_cmd input_cmd_bounce_keys;
+ sway_cmd input_cmd_calibration_matrix;
+ sway_cmd input_cmd_click_method;
+ sway_cmd input_cmd_clickfinger_button_map;
+@@ -264,6 +265,10 @@ sway_cmd input_cmd_map_from_region;
+ sway_cmd input_cmd_map_to_output;
+ sway_cmd input_cmd_map_to_region;
+ sway_cmd input_cmd_middle_emulation;
++sway_cmd input_cmd_mouse_keys;
++sway_cmd input_cmd_mouse_keys_accel_time;
++sway_cmd input_cmd_mouse_keys_init_delay;
++sway_cmd input_cmd_mouse_keys_max_speed;
+ sway_cmd input_cmd_natural_scroll;
+ sway_cmd input_cmd_pointer_accel;
+ sway_cmd input_cmd_rotation_angle;
+@@ -273,6 +278,9 @@ sway_cmd input_cmd_repeat_rate;
+ sway_cmd input_cmd_scroll_button;
+ sway_cmd input_cmd_scroll_button_lock;
+ sway_cmd input_cmd_scroll_method;
++sway_cmd input_cmd_slow_keys;
++sway_cmd input_cmd_sticky_keys;
++sway_cmd input_cmd_sticky_keys_two_key_off;
+ sway_cmd input_cmd_tap;
+ sway_cmd input_cmd_tap_button_map;
+ sway_cmd input_cmd_tool_mode;
+diff --git a/include/sway/config.h b/include/sway/config.h
+index 16b822f..30908b7 100644
+--- a/include/sway/config.h
++++ b/include/sway/config.h
+@@ -181,6 +181,15 @@ struct input_config {
+ 	int xkb_numlock;
+ 	int xkb_capslock;
+ 
++	int sticky_keys;
++	int sticky_keys_two_key_off;
++	int slow_keys;
++	int bounce_keys;
++	int mouse_keys;
++	int mouse_keys_init_delay;
++	int mouse_keys_accel_time;
++	int mouse_keys_max_speed;
++
+ 	struct input_config_mapped_from_region *mapped_from_region;
+ 
+ 	enum input_config_mapped_to mapped_to;
+diff --git a/include/sway/input/keyboard.h b/include/sway/input/keyboard.h
+index 571d9e6..43986f6 100644
+--- a/include/sway/input/keyboard.h
++++ b/include/sway/input/keyboard.h
+@@ -1,6 +1,7 @@
+ #ifndef _SWAY_INPUT_KEYBOARD_H
+ #define _SWAY_INPUT_KEYBOARD_H
+ 
++#include <time.h>
+ #include "sway/input/seat.h"
+ 
+ #define SWAY_KEYBOARD_PRESSED_KEYS_CAP 32
+@@ -48,6 +49,60 @@ struct sway_shortcut_state {
+ 	uint32_t current_key;
+ };
+ 
++/**
++ * Effective accessibility settings of a keyboard (see sway-input(5)).
++ */
++struct sway_keyboard_a11y_config {
++	bool sticky_keys;
++	bool sticky_keys_two_key_off;
++	int slow_keys; // ms, 0 disables
++	int bounce_keys; // ms, 0 disables
++	bool mouse_keys;
++	int mouse_keys_init_delay; // ms
++	int mouse_keys_accel_time; // ms
++	int mouse_keys_max_speed; // pixels per second
++};
++
++struct sway_key_set {
++	uint32_t keycodes[SWAY_KEYBOARD_PRESSED_KEYS_CAP];
++	size_t len;
++};
++
++struct sway_keyboard_a11y {
++	struct sway_keyboard_a11y_config config;
++
++	// Keys whose press was passed on, and keys whose press was dropped (their
++	// release is dropped too)
++	struct sway_key_set delivered;
++	struct sway_key_set dropped;
++
++	// Sticky keys
++	uint32_t sticky_tap_keycode; // modifier pressed on its own
++	xkb_mod_mask_t sticky_latched;
++	xkb_mod_mask_t sticky_locked;
++	// Modifiers added to the xkb state on top of its own ones
++	xkb_mod_mask_t applied_depressed;
++	xkb_mod_mask_t applied_latched;
++	xkb_mod_mask_t applied_locked;
++
++	// Slow keys
++	struct wl_list slow_keys; // sway_slow_key::link
++
++	// Bounce keys: time of the last accepted press of recent keys
++	struct {
++		uint32_t keycode;
++		uint32_t time_msec;
++	} bounce_keys[SWAY_KEYBOARD_PRESSED_KEYS_CAP];
++	size_t bounce_keys_len;
++
++	// Mouse keys
++	struct wl_event_source *mouse_keys_timer;
++	uint32_t mouse_keys_keycode; // direction key being held, or 0
++	int mouse_keys_dx, mouse_keys_dy;
++	struct timespec mouse_keys_start;
++	double mouse_keys_distance;
++};
++
+ struct sway_keyboard {
+ 	struct sway_seat_device *seat_device;
+ 	struct wlr_keyboard *wlr;
+@@ -58,6 +113,8 @@ struct sway_keyboard {
+ 	int32_t repeat_rate;
+ 	int32_t repeat_delay;
+ 
++	struct sway_keyboard_a11y a11y;
++
+ 	struct wl_listener keyboard_key;
+ 	struct wl_listener keyboard_modifiers;
+ 
+@@ -92,4 +149,29 @@ void sway_keyboard_configure(struct sway_keyboard *keyboard);
+ void sway_keyboard_destroy(struct sway_keyboard *keyboard);
+ 
+ void sway_keyboard_disarm_key_repeat(struct sway_keyboard *keyboard);
++
++/**
++ * Process a key event: bindings, then delivery to the focused client.
++ */
++void sway_keyboard_handle_key(struct sway_keyboard *keyboard,
++		struct wlr_keyboard_key_event *event);
++
++void sway_keyboard_a11y_get_config(const struct input_config *ic,
++		struct sway_keyboard_a11y_config *config);
++
++void sway_keyboard_a11y_init(struct sway_keyboard *keyboard);
++
++void sway_keyboard_a11y_configure(struct sway_keyboard *keyboard,
++		const struct input_config *ic);
++
++void sway_keyboard_a11y_finish(struct sway_keyboard *keyboard);
++
++bool sway_keyboard_a11y_enabled(const struct sway_keyboard *keyboard);
++
++/**
++ * Apply the accessibility settings to a key event. Returns false if they are
++ * all disabled and the event should be handled as usual.
++ */
++bool sway_keyboard_a11y_handle_key(struct sway_keyboard *keyboard,
++		struct wlr_keyboard_key_event *event);
+ #endif
+diff --git a/sway/commands/input.c b/sway/commands/input.c
+index 310375a..3228a59 100644
+--- a/sway/commands/input.c
++++ b/sway/commands/input.c
+@@ -9,6 +9,7 @@
+ // must be in order for the bsearch
+ static const struct cmd_handler input_handlers[] = {
+ 	{ "accel_profile", input_cmd_accel_profile },
++	{ "bounce_keys", input_cmd_bounce_keys },
+ 	{ "calibration_matrix", input_cmd_calibration_matrix },
+ 	{ "click_method", input_cmd_click_method },
+ 	{ "clickfinger_button_map", input_cmd_clickfinger_button_map },
+@@ -22,6 +23,10 @@ static const struct cmd_handler input_handlers[] = {
+ 	{ "map_to_output", input_cmd_map_to_output },
+ 	{ "map_to_region", input_cmd_map_to_region },
+ 	{ "middle_emulation", input_cmd_middle_emulation },
++	{ "mouse_keys", input_cmd_mouse_keys },
++	{ "mouse_keys_accel_time", input_cmd_mouse_keys_accel_time },
++	{ "mouse_keys_init_delay", input_cmd_mouse_keys_init_delay },
++	{ "mouse_keys_max_speed", input_cmd_mouse_keys_max_speed },
+ 	{ "natural_scroll", input_cmd_natural_scroll },
+ 	{ "pointer_accel", input_cmd_pointer_accel },
+ 	{ "repeat_delay", input_cmd_repeat_delay },
+@@ -31,6 +36,9 @@ static const struct cmd_handler input_handlers[] = {
+ 	{ "scroll_button_lock", input_cmd_scroll_button_lock },
+ 	{ "scroll_factor", input_cmd_scroll_factor },
+ 	{ "scroll_method", input_cmd_scroll_method },
++	{ "slow_keys", input_cmd_slow_keys },
++	{ "sticky_keys", input_cmd_sticky_keys },
++	{ "sticky_keys_two_key_off", input_cmd_sticky_keys_two_key_off },
+ 	{ "tap", input_cmd_tap },
+ 	{ "tap_button_map", input_cmd_tap_button_map },
+ 	{ "tool_mode", input_cmd_tool_mode },
+diff --git a/sway/commands/input/bounce_keys.c b/sway/commands/input/bounce_keys.c
+new file mode 100644
+index 0000000..861a524
+--- /dev/null
++++ b/sway/commands/input/bounce_keys.c
+@@ -0,0 +1,25 @@
++#include <limits.h>
++#include <stdlib.h>
++#include "sway/config.h"
++#include "sway/commands.h"
++
++struct cmd_results *input_cmd_bounce_keys(int argc, char **argv) {
++	struct cmd_results *error = NULL;
++	if ((error = checkarg(argc, "bounce_keys", EXPECTED_EQUAL_TO, 1))) {
++		return error;
++	}
++	struct input_config *ic = config->handler_context.input_config;
++	if (!ic) {
++		return cmd_results_new(CMD_FAILURE, "No input device defined.");
++	}
++
++	char *end;
++	long value = strtol(argv[0], &end, 10);
++	if (end == argv[0] || *end || value < 0 || value > INT_MAX) {
++		return cmd_results_new(CMD_INVALID,
++			"bounce_keys expects a non-negative number of milliseconds");
++	}
++	ic->bounce_keys = value;
++
++	return cmd_results_new(CMD_SUCCESS, NULL);
++}
+diff --git a/sway/commands/input/mouse_keys.c b/sway/commands/input/mouse_keys.c
+new file mode 100644
+index 0000000..a09cd19
+--- /dev/null
++++ b/sway/commands/input/mouse_keys.c
+@@ -0,0 +1,25 @@
++#include <strings.h>
++#include "sway/config.h"
++#include "sway/commands.h"
++
++struct cmd_results *input_cmd_mouse_keys(int argc, char **argv) {
++	struct cmd_results *error = NULL;
++	if ((error = checkarg(argc, "mouse_keys", EXPECTED_EQUAL_TO, 1))) {
++		return error;
++	}
++	struct input_config *ic = config->handler_context.input_config;
++	if (!ic) {
++		return cmd_results_new(CMD_FAILURE, "No input device defined.");
++	}
++
++	if (strcasecmp(argv[0], "enabled") == 0) {
++		ic->mouse_keys = 1;
++	} else if (strcasecmp(argv[0], "disabled") == 0) {
++		ic->mouse_keys = 0;
++	} else {
++		return cmd_results_new(CMD_INVALID,
++			"Expected 'mouse_keys enabled|disabled'");
++	}
++
++	return cmd_results_new(CMD_SUCCESS, NULL);
++}
+diff --git a/sway/commands/input/mouse_keys_accel_time.c b/sway/commands/input/mouse_keys_accel_time.c
+new file mode 100644
+index 0000000..f210923
+--- /dev/null
++++ b/sway/commands/input/mouse_keys_accel_time.c
+@@ -0,0 +1,25 @@
++#include <limits.h>
++#include <stdlib.h>
++#include "sway/config.h"
++#include "sway/commands.h"
++
++struct cmd_results *input_cmd_mouse_keys_accel_time(int argc, char **argv) {
++	struct cmd_results *error = NULL;
++	if ((error = checkarg(argc, "mouse_keys_accel_time", EXPECTED_EQUAL_TO, 1))) {
++		return error;
++	}
++	struct input_config *ic = config->handler_context.input_config;
++	if (!ic) {
++		return cmd_results_new(CMD_FAILURE, "No input device defined.");
++	}
++
++	char *end;
++	long value = strtol(argv[0], &end, 10);
++	if (end == argv[0] || *end || value < 0 || value > INT_MAX) {
++		return cmd_results_new(CMD_INVALID,
++			"mouse_keys_accel_time expects a non-negative number of milliseconds");
++	}
++	ic->mouse_keys_accel_time = value;
++
++	return cmd_results_new(CMD_SUCCESS, NULL);
++}
+diff --git a/sway/commands/input/mouse_keys_init_delay.c b/sway/commands/input/mouse_keys_init_delay.c
+new file mode 100644
+index 0000000..f52f4d2
+--- /dev/null
++++ b/sway/commands/input/mouse_keys_init_delay.c
+@@ -0,0 +1,25 @@
++#include <limits.h>
++#include <stdlib.h>
++#include "sway/config.h"
++#include "sway/commands.h"
++
++struct cmd_results *input_cmd_mouse_keys_init_delay(int argc, char **argv) {
++	struct cmd_results *error = NULL;
++	if ((error = checkarg(argc, "mouse_keys_init_delay", EXPECTED_EQUAL_TO, 1))) {
++		return error;
++	}
++	struct input_config *ic = config->handler_context.input_config;
++	if (!ic) {
++		return cmd_results_new(CMD_FAILURE, "No input device defined.");
++	}
++
++	char *end;
++	long value = strtol(argv[0], &end, 10);
++	if (end == argv[0] || *end || value < 0 || value > INT_MAX) {
++		return cmd_results_new(CMD_INVALID,
++			"mouse_keys_init_delay expects a non-negative number of milliseconds");
++	}
++	ic->mouse_keys_init_delay = value;
++
++	return cmd_results_new(CMD_SUCCESS, NULL);
++}
+diff --git a/sway/commands/input/mouse_keys_max_speed.c b/sway/commands/input/mouse_keys_max_speed.c
+new file mode 100644
+index 0000000..12d77ef
+--- /dev/null
++++ b/sway/commands/input/mouse_keys_max_speed.c
+@@ -0,0 +1,25 @@
++#include <limits.h>
++#include <stdlib.h>
++#include "sway/config.h"
++#include "sway/commands.h"
++
++struct cmd_results *input_cmd_mouse_keys_max_speed(int argc, char **argv) {
++	struct cmd_results *error = NULL;
++	if ((error = checkarg(argc, "mouse_keys_max_speed", EXPECTED_EQUAL_TO, 1))) {
++		return error;
++	}
++	struct input_config *ic = config->handler_context.input_config;
++	if (!ic) {
++		return cmd_results_new(CMD_FAILURE, "No input device defined.");
++	}
++
++	char *end;
++	long value = strtol(argv[0], &end, 10);
++	if (end == argv[0] || *end || value < 1 || value > INT_MAX) {
++		return cmd_results_new(CMD_INVALID,
++			"mouse_keys_max_speed expects at least 1 pixel per second");
++	}
++	ic->mouse_keys_max_speed = value;
++
++	return cmd_results_new(CMD_SUCCESS, NULL);
++}
+diff --git a/sway/commands/input/slow_keys.c b/sway/commands/input/slow_keys.c
+new file mode 100644
+index 0000000..f927357
+--- /dev/null
++++ b/sway/commands/input/slow_keys.c
+@@ -0,0 +1,25 @@
++#include <limits.h>
++#include <stdlib.h>
++#include "sway/config.h"
++#include "sway/commands.h"
++
++struct cmd_results *input_cmd_slow_keys(int argc, char **argv) {
++	struct cmd_results *error = NULL;
++	if ((error = checkarg(argc, "slow_keys", EXPECTED_EQUAL_TO, 1))) {
++		return error;
++	}
++	struct input_config *ic = config->handler_context.input_config;
++	if (!ic) {
++		return cmd_results_new(CMD_FAILURE, "No input device defined.");
++	}
++
++	char *end;
++	long value = strtol(argv[0], &end, 10);
++	if (end == argv[0] || *end || value < 0 || value > INT_MAX) {
++		return cmd_results_new(CMD_INVALID,
++			"slow_keys expects a non-negative number of milliseconds");
++	}
++	ic->slow_keys = value;
++
++	return cmd_results_new(CMD_SUCCESS, NULL);
++}
+diff --git a/sway/commands/input/sticky_keys.c b/sway/commands/input/sticky_keys.c
+new file mode 100644
+index 0000000..68e3255
+--- /dev/null
++++ b/sway/commands/input/sticky_keys.c
+@@ -0,0 +1,25 @@
++#include <strings.h>
++#include "sway/config.h"
++#include "sway/commands.h"
++
++struct cmd_results *input_cmd_sticky_keys(int argc, char **argv) {
++	struct cmd_results *error = NULL;
++	if ((error = checkarg(argc, "sticky_keys", EXPECTED_EQUAL_TO, 1))) {
++		return error;
++	}
++	struct input_config *ic = config->handler_context.input_config;
++	if (!ic) {
++		return cmd_results_new(CMD_FAILURE, "No input device defined.");
++	}
++
++	if (strcasecmp(argv[0], "enabled") == 0) {
++		ic->sticky_keys = 1;
++	} else if (strcasecmp(argv[0], "disabled") == 0) {
++		ic->sticky_keys = 0;
++	} else {
++		return cmd_results_new(CMD_INVALID,
++			"Expected 'sticky_keys enabled|disabled'");
++	}
++
++	return cmd_results_new(CMD_SUCCESS, NULL);
++}
+diff --git a/sway/commands/input/sticky_keys_two_key_off.c b/sway/commands/input/sticky_keys_two_key_off.c
+new file mode 100644
+index 0000000..efa6705
+--- /dev/null
++++ b/sway/commands/input/sticky_keys_two_key_off.c
+@@ -0,0 +1,25 @@
++#include <strings.h>
++#include "sway/config.h"
++#include "sway/commands.h"
++
++struct cmd_results *input_cmd_sticky_keys_two_key_off(int argc, char **argv) {
++	struct cmd_results *error = NULL;
++	if ((error = checkarg(argc, "sticky_keys_two_key_off", EXPECTED_EQUAL_TO, 1))) {
++		return error;
++	}
++	struct input_config *ic = config->handler_context.input_config;
++	if (!ic) {
++		return cmd_results_new(CMD_FAILURE, "No input device defined.");
++	}
++
++	if (strcasecmp(argv[0], "enabled") == 0) {
++		ic->sticky_keys_two_key_off = 1;
++	} else if (strcasecmp(argv[0], "disabled") == 0) {
++		ic->sticky_keys_two_key_off = 0;
++	} else {
++		return cmd_results_new(CMD_INVALID,
++			"Expected 'sticky_keys_two_key_off enabled|disabled'");
++	}
++
++	return cmd_results_new(CMD_SUCCESS, NULL);
++}
+diff --git a/sway/config/input.c b/sway/config/input.c
+index 1fb737b..b15ebe4 100644
+--- a/sway/config/input.c
++++ b/sway/config/input.c
+@@ -43,6 +43,14 @@ struct input_config *new_input_config(const char* identifier) {
+ 	input->repeat_rate = INT_MIN;
+ 	input->xkb_numlock = INT_MIN;
+ 	input->xkb_capslock = INT_MIN;
++	input->sticky_keys = INT_MIN;
++	input->sticky_keys_two_key_off = INT_MIN;
++	input->slow_keys = INT_MIN;
++	input->bounce_keys = INT_MIN;
++	input->mouse_keys = INT_MIN;
++	input->mouse_keys_init_delay = INT_MIN;
++	input->mouse_keys_accel_time = INT_MIN;
++	input->mouse_keys_max_speed = INT_MIN;
+ 	input->xkb_file_is_set = false;
+ 	input->tools = create_list();
+ 
+@@ -144,6 +152,30 @@ void merge_input_config(struct input_config *dst, struct input_config *src) {
+ 	if (src->xkb_capslock != INT_MIN) {
+ 		dst->xkb_capslock = src->xkb_capslock;
+ 	}
++	if (src->sticky_keys != INT_MIN) {
++		dst->sticky_keys = src->sticky_keys;
++	}
++	if (src->sticky_keys_two_key_off != INT_MIN) {
++		dst->sticky_keys_two_key_off = src->sticky_keys_two_key_off;
++	}
++	if (src->slow_keys != INT_MIN) {
++		dst->slow_keys = src->slow_keys;
++	}
++	if (src->bounce_keys != INT_MIN) {
++		dst->bounce_keys = src->bounce_keys;
++	}
++	if (src->mouse_keys != INT_MIN) {
++		dst->mouse_keys = src->mouse_keys;
++	}
++	if (src->mouse_keys_init_delay != INT_MIN) {
++		dst->mouse_keys_init_delay = src->mouse_keys_init_delay;
++	}
++	if (src->mouse_keys_accel_time != INT_MIN) {
++		dst->mouse_keys_accel_time = src->mouse_keys_accel_time;
++	}
++	if (src->mouse_keys_max_speed != INT_MIN) {
++		dst->mouse_keys_max_speed = src->mouse_keys_max_speed;
++	}
+ 	if (src->mapped_from_region) {
+ 		free(dst->mapped_from_region);
+ 		dst->mapped_from_region =
+diff --git a/sway/input/keyboard.c b/sway/input/keyboard.c
+index d182373..281d6a8 100644
+--- a/sway/input/keyboard.c
++++ b/sway/input/keyboard.c
+@@ -430,7 +430,7 @@ static struct wlr_input_method_keyboard_grab_v2 *keyboard_get_im_grab(
+ 	return input_method->keyboard_grab;
+ }
+ 
+-static void handle_key_event(struct sway_keyboard *keyboard,
++void sway_keyboard_handle_key(struct sway_keyboard *keyboard,
+ 		struct wlr_keyboard_key_event *event) {
+ 	struct sway_seat *seat = keyboard->seat_device->sway_seat;
+ 	struct wlr_seat *wlr_seat = seat->wlr_seat;
+@@ -588,14 +588,16 @@ static void handle_key_event(struct sway_keyboard *keyboard,
+ static void handle_keyboard_key(struct wl_listener *listener, void *data) {
+ 	struct sway_keyboard *keyboard =
+ 		wl_container_of(listener, keyboard, keyboard_key);
+-	handle_key_event(keyboard, data);
++	if (!sway_keyboard_a11y_handle_key(keyboard, data)) {
++		sway_keyboard_handle_key(keyboard, data);
++	}
+ }
+ 
+ static void handle_keyboard_group_key(struct wl_listener *listener,
+ 		void *data) {
+ 	struct sway_keyboard_group *sway_group =
+ 		wl_container_of(listener, sway_group, keyboard_key);
+-	handle_key_event(sway_group->seat_device->keyboard, data);
++	sway_keyboard_handle_key(sway_group->seat_device->keyboard, data);
+ }
+ 
+ static void handle_keyboard_group_enter(struct wl_listener *listener,
+@@ -749,6 +751,7 @@ struct sway_keyboard *sway_keyboard_create(struct sway_seat *seat,
+ 
+ 	keyboard->key_repeat_source = wl_event_loop_add_timer(server.wl_event_loop,
+ 			handle_keyboard_repeat, keyboard);
++	sway_keyboard_a11y_init(keyboard);
+ 
+ 	return keyboard;
+ }
+@@ -867,6 +870,12 @@ static void sway_keyboard_group_remove_invalid(struct sway_keyboard *keyboard) {
+ 		return;
+ 	}
+ 
++	if (sway_keyboard_a11y_enabled(keyboard)) {
++		// Accessibility keys keep their state per keyboard
++		sway_keyboard_group_remove(keyboard);
++		return;
++	}
++
+ 	struct sway_seat *seat = keyboard->seat_device->sway_seat;
+ 	struct seat_config *sc = seat_get_config(seat);
+ 	if (!sc) {
+@@ -898,6 +907,11 @@ static void sway_keyboard_group_add(struct sway_keyboard *keyboard) {
+ 		return;
+ 	}
+ 
++	if (sway_keyboard_a11y_enabled(keyboard)) {
++		// Accessibility keys keep their state per keyboard
++		return;
++	}
++
+ 	if (!sc) {
+ 		sc = seat_get_config_by_name("*");
+ 	}
+@@ -1104,6 +1118,8 @@ void sway_keyboard_configure(struct sway_keyboard *keyboard) {
+ 				keyboard->repeat_rate, keyboard->repeat_delay);
+ 	}
+ 
++	sway_keyboard_a11y_configure(keyboard, input_config);
++
+ 	if (!keyboard->seat_device->input_device->is_virtual) {
+ 		sway_keyboard_set_layout(keyboard, input_config);
+ 	}
+@@ -1144,5 +1160,6 @@ void sway_keyboard_destroy(struct sway_keyboard *keyboard) {
+ 	wl_list_remove(&keyboard->keyboard_modifiers.link);
+ 	sway_keyboard_disarm_key_repeat(keyboard);
+ 	wl_event_source_remove(keyboard->key_repeat_source);
++	sway_keyboard_a11y_finish(keyboard);
+ 	free(keyboard);
+ }
+diff --git a/sway/input/keyboard_a11y.c b/sway/input/keyboard_a11y.c
+new file mode 100644
+index 0000000..4be3922
+--- /dev/null
++++ b/sway/input/keyboard_a11y.c
+@@ -0,0 +1,591 @@
++#include <limits.h>
++#include <stdlib.h>
++#include <time.h>
++#include <wlr/interfaces/wlr_keyboard.h>
++#include <wlr/types/wlr_keyboard.h>
++#include <wlr/types/wlr_seat.h>
++#include <xkbcommon/xkbcommon.h>
++#include <xkbcommon/xkbcommon-names.h>
++#include "sway/config.h"
++#include "sway/input/cursor.h"
++#include "sway/input/keyboard.h"
++#include "sway/input/seat.h"
++#include "sway/server.h"
++#include "log.h"
++
++// Interval between two pointer motions while a mouse key is held
++#define MOUSE_KEYS_INTERVAL 10 // ms
++
++struct sway_slow_key {
++	struct sway_keyboard *keyboard;
++	struct wlr_keyboard_key_event event;
++	struct wl_event_source *timer;
++	struct wl_list link; // sway_keyboard_a11y::slow_keys
++};
++
++static uint32_t get_current_time_msec(void) {
++	struct timespec now;
++	clock_gettime(CLOCK_MONOTONIC, &now);
++	return now.tv_sec * 1000 + now.tv_nsec / 1000000;
++}
++
++static bool key_set_has(const struct sway_key_set *set, uint32_t keycode) {
++	for (size_t i = 0; i < set->len; ++i) {
++		if (set->keycodes[i] == keycode) {
++			return true;
++		}
++	}
++	return false;
++}
++
++static void key_set_add(struct sway_key_set *set, uint32_t keycode) {
++	if (set->len < SWAY_KEYBOARD_PRESSED_KEYS_CAP &&
++			!key_set_has(set, keycode)) {
++		set->keycodes[set->len++] = keycode;
++	}
++}
++
++static bool key_set_remove(struct sway_key_set *set, uint32_t keycode) {
++	for (size_t i = 0; i < set->len; ++i) {
++		if (set->keycodes[i] == keycode) {
++			set->keycodes[i] = set->keycodes[--set->len];
++			return true;
++		}
++	}
++	return false;
++}
++
++void sway_keyboard_a11y_get_config(const struct input_config *ic,
++		struct sway_keyboard_a11y_config *config) {
++	*config = (struct sway_keyboard_a11y_config){
++		.sticky_keys = false,
++		.sticky_keys_two_key_off = true,
++		.slow_keys = 0,
++		.bounce_keys = 0,
++		.mouse_keys = false,
++		.mouse_keys_init_delay = 300,
++		.mouse_keys_accel_time = 300,
++		.mouse_keys_max_speed = 1000,
++	};
++	if (!ic) {
++		return;
++	}
++	if (ic->sticky_keys != INT_MIN) {
++		config->sticky_keys = ic->sticky_keys;
++	}
++	if (ic->sticky_keys_two_key_off != INT_MIN) {
++		config->sticky_keys_two_key_off = ic->sticky_keys_two_key_off;
++	}
++	if (ic->slow_keys != INT_MIN) {
++		config->slow_keys = ic->slow_keys;
++	}
++	if (ic->bounce_keys != INT_MIN) {
++		config->bounce_keys = ic->bounce_keys;
++	}
++	if (ic->mouse_keys != INT_MIN) {
++		config->mouse_keys = ic->mouse_keys;
++	}
++	if (ic->mouse_keys_init_delay != INT_MIN) {
++		config->mouse_keys_init_delay = ic->mouse_keys_init_delay;
++	}
++	if (ic->mouse_keys_accel_time != INT_MIN) {
++		config->mouse_keys_accel_time = ic->mouse_keys_accel_time;
++	}
++	if (ic->mouse_keys_max_speed != INT_MIN) {
++		config->mouse_keys_max_speed = ic->mouse_keys_max_speed;
++	}
++}
++
++bool sway_keyboard_a11y_enabled(const struct sway_keyboard *keyboard) {
++	const struct sway_keyboard_a11y_config *config = &keyboard->a11y.config;
++	return config->sticky_keys || config->slow_keys > 0 ||
++		config->bounce_keys > 0 || config->mouse_keys;
++}
++
++/**
++ * Returns the modifier that sticky keys handles for this key: Shift, Control,
++ * Alt or Super, or 0 for any other key.
++ */
++static xkb_mod_mask_t sticky_keys_get_modifier(struct sway_keyboard *keyboard,
++		uint32_t keycode) {
++	struct xkb_keymap *keymap = keyboard->wlr->keymap;
++	if (!keymap) {
++		return 0;
++	}
++	xkb_keycode_t xkb_keycode = keycode + 8;
++	xkb_layout_index_t layout = xkb_state_key_get_layout(
++		keyboard->wlr->xkb_state, xkb_keycode);
++	if (layout == XKB_LAYOUT_INVALID) {
++		return 0;
++	}
++	const xkb_keysym_t *keysyms;
++	int len = xkb_keymap_key_get_syms_by_level(keymap, xkb_keycode, layout,
++		0, &keysyms);
++	for (int i = 0; i < len; ++i) {
++		const char *name = NULL;
++		switch (keysyms[i]) {
++		case XKB_KEY_Shift_L:
++		case XKB_KEY_Shift_R:
++			name = XKB_MOD_NAME_SHIFT;
++			break;
++		case XKB_KEY_Control_L:
++		case XKB_KEY_Control_R:
++			name = XKB_MOD_NAME_CTRL;
++			break;
++		case XKB_KEY_Alt_L:
++		case XKB_KEY_Alt_R:
++		case XKB_KEY_Meta_L:
++		case XKB_KEY_Meta_R:
++			name = XKB_MOD_NAME_ALT;
++			break;
++		case XKB_KEY_Super_L:
++		case XKB_KEY_Super_R:
++			name = XKB_MOD_NAME_LOGO;
++			break;
++		}
++		if (name) {
++			xkb_mod_index_t index = xkb_keymap_mod_get_index(keymap, name);
++			return index == XKB_MOD_INVALID ? 0 : (xkb_mod_mask_t)1 << index;
++		}
++	}
++	return 0;
++}
++
++static xkb_mod_mask_t sticky_keys_get_held(struct sway_keyboard *keyboard) {
++	xkb_mod_mask_t held = 0;
++	struct sway_key_set *delivered = &keyboard->a11y.delivered;
++	for (size_t i = 0; i < delivered->len; ++i) {
++		held |= sticky_keys_get_modifier(keyboard, delivered->keycodes[i]);
++	}
++	return held;
++}
++
++/**
++ * Update the latched and locked modifiers after a key has been delivered.
++ * `held` is the set of modifiers that were held before this key event.
++ */
++static void sticky_keys_handle_key(struct sway_keyboard *keyboard,
++		struct wlr_keyboard_key_event *event, xkb_mod_mask_t held) {
++	struct sway_keyboard_a11y *a11y = &keyboard->a11y;
++	xkb_mod_mask_t modifier = sticky_keys_get_modifier(keyboard, event->keycode);
++
++	if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
++		a11y->sticky_tap_keycode = 0;
++		if (!modifier) {
++			// The latched modifiers applied to this key press
++			a11y->sticky_latched = 0;
++		} else if (held) {
++			// Modifiers pressed together are ordinary modifiers
++			if (a11y->config.sticky_keys_two_key_off) {
++				a11y->sticky_latched = 0;
++				a11y->sticky_locked = 0;
++			}
++		} else {
++			a11y->sticky_tap_keycode = event->keycode;
++		}
++		return;
++	}
++
++	if (!modifier || a11y->sticky_tap_keycode != event->keycode) {
++		return;
++	}
++	a11y->sticky_tap_keycode = 0;
++
++	// A tap latches the modifier, a second one locks it, a third one unlocks
++	if (a11y->sticky_locked & modifier) {
++		a11y->sticky_locked &= ~modifier;
++	} else if (a11y->sticky_latched & modifier) {
++		a11y->sticky_latched &= ~modifier;
++		a11y->sticky_locked |= modifier;
++	} else {
++		a11y->sticky_latched |= modifier;
++	}
++}
++
++/**
++ * Notify the keyboard's modifiers, combining the xkb state with the sticky
++ * keys state.
++ */
++static void sync_modifiers(struct sway_keyboard *keyboard) {
++	struct sway_keyboard_a11y *a11y = &keyboard->a11y;
++	struct wlr_keyboard *wlr = keyboard->wlr;
++	if (!wlr->xkb_state) {
++		return;
++	}
++
++	xkb_mod_mask_t depressed = xkb_state_serialize_mods(wlr->xkb_state,
++		XKB_STATE_MODS_DEPRESSED) & ~a11y->applied_depressed;
++	xkb_mod_mask_t latched = xkb_state_serialize_mods(wlr->xkb_state,
++		XKB_STATE_MODS_LATCHED) & ~a11y->applied_latched;
++	xkb_mod_mask_t locked = xkb_state_serialize_mods(wlr->xkb_state,
++		XKB_STATE_MODS_LOCKED) & ~a11y->applied_locked;
++	xkb_layout_index_t group = xkb_state_serialize_layout(wlr->xkb_state,
++		XKB_STATE_LAYOUT_EFFECTIVE);
++
++	xkb_mod_mask_t held = 0, sticky_latched = 0, sticky_locked = 0;
++	if (a11y->config.sticky_keys) {
++		// Virtual keyboards don't update the xkb state from key events.
++		// Report the modifier keys they hold as depressed, or the latched
++		// state would come without them.
++		held = sticky_keys_get_held(keyboard);
++		sticky_latched = a11y->sticky_latched;
++		sticky_locked = a11y->sticky_locked;
++	}
++	a11y->applied_depressed = held & ~depressed;
++	a11y->applied_latched = sticky_latched & ~latched;
++	a11y->applied_locked = sticky_locked & ~locked;
++	depressed |= held;
++	latched |= sticky_latched;
++	locked |= sticky_locked;
++
++	if (depressed != wlr->modifiers.depressed ||
++			latched != wlr->modifiers.latched ||
++			locked != wlr->modifiers.locked ||
++			group != wlr->modifiers.group) {
++		wlr_keyboard_notify_modifiers(wlr, depressed, latched, locked, group);
++	}
++}
++
++// Both keysyms of each keypad key, so that NumLock doesn't matter
++static const struct {
++	xkb_keysym_t keysyms[2];
++	int dx, dy;
++} mouse_keys_directions[] = {
++	{ { XKB_KEY_KP_1, XKB_KEY_KP_End }, -1, 1 },
++	{ { XKB_KEY_KP_2, XKB_KEY_KP_Down }, 0, 1 },
++	{ { XKB_KEY_KP_3, XKB_KEY_KP_Page_Down }, 1, 1 },
++	{ { XKB_KEY_KP_4, XKB_KEY_KP_Left }, -1, 0 },
++	{ { XKB_KEY_KP_6, XKB_KEY_KP_Right }, 1, 0 },
++	{ { XKB_KEY_KP_7, XKB_KEY_KP_Home }, -1, -1 },
++	{ { XKB_KEY_KP_8, XKB_KEY_KP_Up }, 0, -1 },
++	{ { XKB_KEY_KP_9, XKB_KEY_KP_Page_Up }, 1, -1 },
++};
++
++static bool mouse_keys_get_direction(struct sway_keyboard *keyboard,
++		uint32_t keycode, int *dx, int *dy) {
++	if (!keyboard->wlr->xkb_state) {
++		return false;
++	}
++	xkb_keysym_t keysym =
++		xkb_state_key_get_one_sym(keyboard->wlr->xkb_state, keycode + 8);
++	size_t len = sizeof(mouse_keys_directions) / sizeof(mouse_keys_directions[0]);
++	for (size_t i = 0; i < len; ++i) {
++		if (mouse_keys_directions[i].keysyms[0] == keysym ||
++				mouse_keys_directions[i].keysyms[1] == keysym) {
++			*dx = mouse_keys_directions[i].dx;
++			*dy = mouse_keys_directions[i].dy;
++			return true;
++		}
++	}
++	return false;
++}
++
++static void mouse_keys_stop(struct sway_keyboard_a11y *a11y) {
++	a11y->mouse_keys_keycode = 0;
++	wl_event_source_timer_update(a11y->mouse_keys_timer, 0);
++}
++
++static int handle_mouse_keys_timer(void *data) {
++	struct sway_keyboard *keyboard = data;
++	struct sway_keyboard_a11y *a11y = &keyboard->a11y;
++	const struct sway_keyboard_a11y_config *config = &a11y->config;
++
++	struct timespec now;
++	clock_gettime(CLOCK_MONOTONIC, &now);
++	double t = (now.tv_sec - a11y->mouse_keys_start.tv_sec) * 1000.0 +
++		(now.tv_nsec - a11y->mouse_keys_start.tv_nsec) / 1000000.0 -
++		config->mouse_keys_init_delay;
++	if (t < 0) {
++		wl_event_source_timer_update(a11y->mouse_keys_timer, (int)-t + 1);
++		return 0;
++	}
++	wl_event_source_timer_update(a11y->mouse_keys_timer, MOUSE_KEYS_INTERVAL);
++
++	// The speed grows linearly to its maximum over the acceleration time
++	double max_speed = config->mouse_keys_max_speed / 1000.0; // px/ms
++	double accel_time = config->mouse_keys_accel_time;
++	double distance;
++	if (t < accel_time) {
++		distance = max_speed * t * t / (2 * accel_time);
++	} else {
++		distance = max_speed * (t - accel_time / 2);
++	}
++	double step = distance - a11y->mouse_keys_distance;
++	a11y->mouse_keys_distance = distance;
++	if (step <= 0) {
++		return 0;
++	}
++
++	struct sway_cursor *cursor = keyboard->seat_device->sway_seat->cursor;
++	double dx = a11y->mouse_keys_dx * step, dy = a11y->mouse_keys_dy * step;
++	cursor_handle_activity_from_device(cursor, &keyboard->wlr->base);
++	pointer_motion(cursor, get_current_time_msec(), &keyboard->wlr->base,
++		dx, dy, dx, dy);
++	wlr_seat_pointer_notify_frame(cursor->seat->wlr_seat);
++	return 0;
++}
++
++/**
++ * Returns true if the key moves the pointer and must not be delivered.
++ */
++static bool mouse_keys_handle_press(struct sway_keyboard *keyboard,
++		struct wlr_keyboard_key_event *event) {
++	struct sway_keyboard_a11y *a11y = &keyboard->a11y;
++	int dx, dy;
++	if (!a11y->config.mouse_keys ||
++			!mouse_keys_get_direction(keyboard, event->keycode, &dx, &dy)) {
++		return false;
++	}
++
++	a11y->mouse_keys_keycode = event->keycode;
++	a11y->mouse_keys_dx = dx;
++	a11y->mouse_keys_dy = dy;
++	a11y->mouse_keys_distance = 0;
++	clock_gettime(CLOCK_MONOTONIC, &a11y->mouse_keys_start);
++	// A timeout of 0 would disarm the timer
++	wl_event_source_timer_update(a11y->mouse_keys_timer,
++		a11y->config.mouse_keys_init_delay > 0 ?
++		a11y->config.mouse_keys_init_delay : 1);
++	return true;
++}
++
++/**
++ * Deliver a key event that went through bounce keys and slow keys.
++ */
++static void deliver_key(struct sway_keyboard *keyboard,
++		struct wlr_keyboard_key_event *event) {
++	struct sway_keyboard_a11y *a11y = &keyboard->a11y;
++	if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED &&
++			mouse_keys_handle_press(keyboard, event)) {
++		key_set_add(&a11y->dropped, event->keycode);
++		return;
++	}
++
++	xkb_mod_mask_t held = 0;
++	if (a11y->config.sticky_keys) {
++		held = sticky_keys_get_held(keyboard);
++	}
++	if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
++		key_set_add(&a11y->delivered, event->keycode);
++	} else {
++		key_set_remove(&a11y->delivered, event->keycode);
++	}
++
++	sway_keyboard_handle_key(keyboard, event);
++
++	// As wlroots does, update the xkb state after the key event
++	if (event->update_state && keyboard->wlr->xkb_state) {
++		xkb_state_update_key(keyboard->wlr->xkb_state, event->keycode + 8,
++			event->state == WL_KEYBOARD_KEY_STATE_PRESSED ?
++			XKB_KEY_DOWN : XKB_KEY_UP);
++	}
++	if (a11y->config.sticky_keys) {
++		sticky_keys_handle_key(keyboard, event, held);
++		sync_modifiers(keyboard);
++	}
++}
++
++static void slow_key_destroy(struct sway_slow_key *slow_key) {
++	wl_list_remove(&slow_key->link);
++	wl_event_source_remove(slow_key->timer);
++	free(slow_key);
++}
++
++static struct sway_slow_key *slow_key_find(struct sway_keyboard_a11y *a11y,
++		uint32_t keycode) {
++	struct sway_slow_key *slow_key;
++	wl_list_for_each(slow_key, &a11y->slow_keys, link) {
++		if (slow_key->event.keycode == keycode) {
++			return slow_key;
++		}
++	}
++	return NULL;
++}
++
++/**
++ * Deliver the press of a key that has been held for the slow keys delay.
++ */
++static void slow_key_accept(struct sway_slow_key *slow_key) {
++	struct sway_keyboard *keyboard = slow_key->keyboard;
++	struct wlr_keyboard_key_event event = slow_key->event;
++	event.time_msec += keyboard->a11y.config.slow_keys;
++	slow_key_destroy(slow_key);
++	deliver_key(keyboard, &event);
++}
++
++static int handle_slow_key_timer(void *data) {
++	struct sway_slow_key *slow_key = data;
++	struct sway_keyboard *keyboard = slow_key->keyboard;
++	slow_key_accept(slow_key);
++	// Outside of a key event, wlroots won't notify the new modifiers
++	sync_modifiers(keyboard);
++	return 0;
++}
++
++static void slow_keys_handle_press(struct sway_keyboard *keyboard,
++		struct wlr_keyboard_key_event *event) {
++	struct sway_keyboard_a11y *a11y = &keyboard->a11y;
++	struct sway_slow_key *slow_key = calloc(1, sizeof(*slow_key));
++	if (!slow_key) {
++		sway_log(SWAY_ERROR, "Failed to allocate slow key");
++		return;
++	}
++	slow_key->keyboard = keyboard;
++	slow_key->event = *event;
++	slow_key->timer = wl_event_loop_add_timer(server.wl_event_loop,
++		handle_slow_key_timer, slow_key);
++	if (!slow_key->timer) {
++		sway_log(SWAY_ERROR, "Failed to create slow key timer");
++		free(slow_key);
++		return;
++	}
++	wl_list_insert(&a11y->slow_keys, &slow_key->link);
++
++	// Count the hold from the time of the press, unless that time isn't on
++	// our clock
++	int delay = a11y->config.slow_keys;
++	uint32_t age = get_current_time_msec() - event->time_msec;
++	if (age < (uint32_t)delay) {
++		delay -= age;
++	}
++	wl_event_source_timer_update(slow_key->timer, delay);
++}
++
++/**
++ * Returns true if the key was pressed during the bounce keys delay after its
++ * previous accepted press.
++ */
++static bool bounce_keys_reject(struct sway_keyboard_a11y *a11y,
++		struct wlr_keyboard_key_event *event) {
++	uint32_t delay = a11y->config.bounce_keys;
++	size_t oldest = 0;
++	for (size_t i = 0; i < a11y->bounce_keys_len; ++i) {
++		if (a11y->bounce_keys[i].keycode == event->keycode) {
++			if (event->time_msec - a11y->bounce_keys[i].time_msec < delay) {
++				return true;
++			}
++			a11y->bounce_keys[i].time_msec = event->time_msec;
++			return false;
++		}
++		if (event->time_msec - a11y->bounce_keys[i].time_msec >
++				event->time_msec - a11y->bounce_keys[oldest].time_msec) {
++			oldest = i;
++		}
++	}
++
++	size_t i = a11y->bounce_keys_len;
++	if (i < SWAY_KEYBOARD_PRESSED_KEYS_CAP) {
++		a11y->bounce_keys_len++;
++	} else {
++		i = oldest;
++	}
++	a11y->bounce_keys[i].keycode = event->keycode;
++	a11y->bounce_keys[i].time_msec = event->time_msec;
++	return false;
++}
++
++bool sway_keyboard_a11y_handle_key(struct sway_keyboard *keyboard,
++		struct wlr_keyboard_key_event *event) {
++	struct sway_keyboard_a11y *a11y = &keyboard->a11y;
++	if (!sway_keyboard_a11y_enabled(keyboard)) {
++		return false;
++	}
++
++	// Keys are dropped or delivered later, so update the xkb state ourselves
++	// when the key is delivered rather than letting wlroots do it now
++	struct wlr_keyboard_key_event key = *event;
++	event->update_state = false;
++
++	seat_idle_notify_activity(keyboard->seat_device->sway_seat,
++		IDLE_SOURCE_KEYBOARD);
++
++	struct sway_slow_key *slow_key = slow_key_find(a11y, key.keycode);
++	if (key.state == WL_KEYBOARD_KEY_STATE_PRESSED) {
++		// Ignore repeated presses of a key that is already down
++		if (slow_key || key_set_has(&a11y->delivered, key.keycode) ||
++				key_set_has(&a11y->dropped, key.keycode)) {
++			return true;
++		}
++		if (a11y->config.bounce_keys > 0 && bounce_keys_reject(a11y, &key)) {
++			key_set_add(&a11y->dropped, key.keycode);
++			return true;
++		}
++		if (a11y->config.slow_keys > 0) {
++			slow_keys_handle_press(keyboard, &key);
++			return true;
++		}
++	} else if (slow_key) {
++		uint32_t held = key.time_msec - slow_key->event.time_msec;
++		if (held < (uint32_t)a11y->config.slow_keys) {
++			slow_key_destroy(slow_key);
++			return true;
++		}
++		// The press was long enough, but its timer hasn't fired yet
++		slow_key_accept(slow_key);
++	}
++
++	if (key.state == WL_KEYBOARD_KEY_STATE_RELEASED &&
++			key_set_remove(&a11y->dropped, key.keycode)) {
++		if (key.keycode == a11y->mouse_keys_keycode) {
++			mouse_keys_stop(a11y);
++		}
++		return true;
++	}
++
++	deliver_key(keyboard, &key);
++	return true;
++}
++
++void sway_keyboard_a11y_init(struct sway_keyboard *keyboard) {
++	struct sway_keyboard_a11y *a11y = &keyboard->a11y;
++	sway_keyboard_a11y_get_config(NULL, &a11y->config);
++	wl_list_init(&a11y->slow_keys);
++	a11y->mouse_keys_timer = wl_event_loop_add_timer(server.wl_event_loop,
++		handle_mouse_keys_timer, keyboard);
++}
++
++void sway_keyboard_a11y_configure(struct sway_keyboard *keyboard,
++		const struct input_config *ic) {
++	struct sway_keyboard_a11y *a11y = &keyboard->a11y;
++	struct sway_keyboard_a11y_config old = a11y->config;
++	sway_keyboard_a11y_get_config(ic, &a11y->config);
++	const struct sway_keyboard_a11y_config *config = &a11y->config;
++
++	// Pending slow keys are dropped, along with their release
++	if (config->slow_keys == 0) {
++		struct sway_slow_key *slow_key, *tmp;
++		wl_list_for_each_safe(slow_key, tmp, &a11y->slow_keys, link) {
++			key_set_add(&a11y->dropped, slow_key->event.keycode);
++			slow_key_destroy(slow_key);
++		}
++	}
++	if (config->bounce_keys == 0) {
++		a11y->bounce_keys_len = 0;
++	}
++	if (!config->mouse_keys ||
++			config->mouse_keys_init_delay != old.mouse_keys_init_delay ||
++			config->mouse_keys_accel_time != old.mouse_keys_accel_time ||
++			config->mouse_keys_max_speed != old.mouse_keys_max_speed) {
++		mouse_keys_stop(a11y);
++	}
++	if (!sway_keyboard_a11y_enabled(keyboard)) {
++		// Key events bypass us from now on
++		a11y->delivered.len = 0;
++		a11y->dropped.len = 0;
++	}
++	if (config->sticky_keys != old.sticky_keys) {
++		a11y->sticky_tap_keycode = 0;
++		a11y->sticky_latched = 0;
++		a11y->sticky_locked = 0;
++		sync_modifiers(keyboard);
++	}
++}
++
++void sway_keyboard_a11y_finish(struct sway_keyboard *keyboard) {
++	struct sway_keyboard_a11y *a11y = &keyboard->a11y;
++	struct sway_slow_key *slow_key, *tmp;
++	wl_list_for_each_safe(slow_key, tmp, &a11y->slow_keys, link) {
++		slow_key_destroy(slow_key);
++	}
++	wl_event_source_remove(a11y->mouse_keys_timer);
++}
+diff --git a/sway/ipc-json.c b/sway/ipc-json.c
+index 3b69ad3..fec701b 100644
+--- a/sway/ipc-json.c
++++ b/sway/ipc-json.c
+@@ -19,6 +19,7 @@
+ #include "sway/output.h"
+ #include "sway/input/input-manager.h"
+ #include "sway/input/cursor.h"
++#include "sway/input/keyboard.h"
+ #include "sway/input/seat.h"
+ #include "wlr-layer-shell-unstable-v1-protocol.h"
+ #include "sway/desktop/idle_inhibit_v1.h"
+@@ -1163,6 +1164,25 @@ json_object *ipc_json_describe_input(struct sway_input_device *device) {
+ 		json_object_object_add(object, "repeat_rate",
+ 			json_object_new_int(keyboard->repeat_info.rate));
+ 
++		struct sway_keyboard_a11y_config a11y;
++		sway_keyboard_a11y_get_config(input_device_get_config(device), &a11y);
++		json_object_object_add(object, "sticky_keys",
++			json_object_new_boolean(a11y.sticky_keys));
++		json_object_object_add(object, "sticky_keys_two_key_off",
++			json_object_new_boolean(a11y.sticky_keys_two_key_off));
++		json_object_object_add(object, "slow_keys",
++			json_object_new_int(a11y.slow_keys));
++		json_object_object_add(object, "bounce_keys",
++			json_object_new_int(a11y.bounce_keys));
++		json_object_object_add(object, "mouse_keys",
++			json_object_new_boolean(a11y.mouse_keys));
++		json_object_object_add(object, "mouse_keys_init_delay",
++			json_object_new_int(a11y.mouse_keys_init_delay));
++		json_object_object_add(object, "mouse_keys_accel_time",
++			json_object_new_int(a11y.mouse_keys_accel_time));
++		json_object_object_add(object, "mouse_keys_max_speed",
++			json_object_new_int(a11y.mouse_keys_max_speed));
++
+ 		json_object *layouts_arr = json_object_new_array();
+ 		json_object_object_add(object, "xkb_layout_names", layouts_arr);
+ 
+diff --git a/sway/meson.build b/sway/meson.build
+index 5f487d7..c54ecd9 100644
+--- a/sway/meson.build
++++ b/sway/meson.build
+@@ -36,6 +36,7 @@ sway_sources = files(
+ 	'input/switch.c',
+ 	'input/tablet.c',
+ 	'input/text_input.c',
++	'input/keyboard_a11y.c',
+ 
+ 	'config/bar.c',
+ 	'config/output.c',
+@@ -155,6 +156,7 @@ sway_sources = files(
+ 	'commands/bar/wrap_scroll.c',
+ 
+ 	'commands/input/accel_profile.c',
++	'commands/input/bounce_keys.c',
+ 	'commands/input/calibration_matrix.c',
+ 	'commands/input/click_method.c',
+ 	'commands/input/clickfinger_button_map.c',
+@@ -168,6 +170,10 @@ sway_sources = files(
+ 	'commands/input/map_to_output.c',
+ 	'commands/input/map_to_region.c',
+ 	'commands/input/middle_emulation.c',
++	'commands/input/mouse_keys.c',
++	'commands/input/mouse_keys_accel_time.c',
++	'commands/input/mouse_keys_init_delay.c',
++	'commands/input/mouse_keys_max_speed.c',
+ 	'commands/input/natural_scroll.c',
+ 	'commands/input/pointer_accel.c',
+         'commands/input/rotation_angle.c',
+@@ -177,6 +183,9 @@ sway_sources = files(
+ 	'commands/input/scroll_button_lock.c',
+ 	'commands/input/scroll_factor.c',
+ 	'commands/input/scroll_method.c',
++	'commands/input/slow_keys.c',
++	'commands/input/sticky_keys.c',
++	'commands/input/sticky_keys_two_key_off.c',
+ 	'commands/input/tap.c',
+ 	'commands/input/tap_button_map.c',
+ 	'commands/input/tool_mode.c',
+diff --git a/sway/sway-input.5.scd b/sway/sway-input.5.scd
+index 389b205..f947d00 100644
+--- a/sway/sway-input.5.scd
++++ b/sway/sway-input.5.scd
+@@ -94,6 +94,51 @@ The following commands may only be used in the configuration file.
+ *input* <identifier> xkb_numlock enabled|disabled
+ 	Initially enables or disables NumLock on startup, the default is disabled.
+ 
++## KEYBOARD ACCESSIBILITY CONFIGURATION
++
++These options change how key presses are interpreted, for users who have
++difficulty pressing several keys at once, holding keys briefly, or using a
++pointing device. Each keyboard keeps its own state: keyboards with any of these
++options enabled are never grouped (see *keyboard_grouping* below).
++
++*input* <identifier> sticky_keys enabled|disabled
++	Enables or disables sticky keys, the default is disabled. Tapping Shift,
++	Control, Alt or Super latches it: it applies to the next key that is not
++	one of these modifiers. Tapping a latched modifier again locks it until it
++	is tapped once more. Holding a modifier while pressing another key works as
++	usual.
++
++*input* <identifier> sticky_keys_two_key_off enabled|disabled
++	With sticky keys enabled, pressing two modifiers at the same time releases
++	all latched and locked modifiers. The default is enabled.
++
++*input* <identifier> slow_keys <milliseconds>
++	A key press only counts once the key has been held for the given number of
++	milliseconds; shorter presses are ignored. The default is 0, which disables
++	slow keys.
++
++*input* <identifier> bounce_keys <milliseconds>
++	Ignores a press of a key that comes within the given number of milliseconds
++	after the previous accepted press of the same key. The default is 0, which
++	disables bounce keys.
++
++*input* <identifier> mouse_keys enabled|disabled
++	Enables or disables mouse keys, the default is disabled. The keypad keys 1
++	to 4 and 6 to 9 move the pointer in their direction instead of being sent to
++	applications, whatever the state of NumLock.
++
++*input* <identifier> mouse_keys_init_delay <milliseconds>
++	Sets the time between pressing a mouse key and the start of the pointer
++	motion. The default is 300 milliseconds.
++
++*input* <identifier> mouse_keys_accel_time <milliseconds>
++	Sets the time the pointer takes to reach its maximum speed once it starts
++	moving. The default is 300 milliseconds.
++
++*input* <identifier> mouse_keys_max_speed <pixels per second>
++	Sets the maximum speed of the pointer, in pixels per second. The default is
++	1000.
++
+ ## TABLET CONFIGURATION
+ 
+ *input* <identifier> tool_mode <tool> <absolute|relative>
+diff --git a/sway/sway-ipc.7.scd b/sway/sway-ipc.7.scd
+index 70c8313..0699123 100644
+--- a/sway/sway-ipc.7.scd
++++ b/sway/sway-ipc.7.scd
+@@ -1161,6 +1161,31 @@ following properties:
+ |- xkb_active_layout_index
+ :  integer
+ :  (Only keyboards) The index of the active keyboard layout
++|- sticky_keys
++:  boolean
++:  (Only keyboards) Whether sticky keys are enabled
++|- sticky_keys_two_key_off
++:  boolean
++:  (Only keyboards) Whether pressing two modifiers together releases the
++   latched and locked modifiers
++|- slow_keys
++:  integer
++:  (Only keyboards) The slow keys delay in milliseconds, 0 when disabled
++|- bounce_keys
++:  integer
++:  (Only keyboards) The bounce keys delay in milliseconds, 0 when disabled
++|- mouse_keys
++:  boolean
++:  (Only keyboards) Whether mouse keys are enabled
++|- mouse_keys_init_delay
++:  integer
++:  (Only keyboards) The mouse keys initial delay in milliseconds
++|- mouse_keys_accel_time
++:  integer
++:  (Only keyboards) The mouse keys acceleration time in milliseconds
++|- mouse_keys_max_speed
++:  integer
++:  (Only keyboards) The mouse keys maximum speed in pixels per second
+ |- scroll_factor
+ :  floating
+ :  (Only pointers) Multiplier applied on scroll event values.

@@ -1,0 +1,77 @@
+#!/bin/sh
+# 01-regolith-trawl: set_from_resource must keep reading trawl after trawld
+# restarts while sway runs. A trawl proxy kept for the life of sway still
+# calls the old trawld after a restart, so every later config load falls back
+# (Regolith looks stop applying until sway restarts).
+set -eu
+. debian/tests/lib-headless.sh
+in_dbus_session "$@"
+setup_runtime
+start_trawld
+
+key=sway_regolith.test.restart
+before="before-restart-$$"
+after="after-restart-$$"
+
+printf '%s: %s\n' "$key" "$before" > "$WORK/resources"
+load_resources "$WORK/resources" "$key"
+
+# A binding mode named from the resource: sway rebuilds its modes on every
+# config load and lists them over IPC. (A workspace name would not do: sway
+# does not run `workspace <name>` again on reload.)
+cat > "$WORK/config" <<EOC
+set_from_resource \$name $key fallback-name
+mode "\$name" {
+	bindsym Escape mode default
+}
+EOC
+start_sway "$WORK/config"
+
+mode_name() {
+	swaymsg -t get_binding_modes -r | jq -r '.[] | select(. != "default")'
+}
+
+# swaymsg gives up after 3 s, so wait until sway answers again.
+reload() {
+	swaymsg reload > /dev/null 2>&1 || true
+	j=0
+	until swaymsg -t get_version > /dev/null 2>&1; do
+		j=$((j + 1))
+		[ "$j" -le 60 ] && kill -0 "$SWAY_PID" 2>/dev/null || fail "sway stopped answering after reload"
+	done
+}
+
+name=$(mode_name)
+echo "mode name at start: $name"
+[ "$name" = "$before" ] || fail "set_from_resource gave '$name' at start, not '$before'"
+
+# Stop trawld and wait until its bus name is gone, then start a new trawld
+# (it gets a new unique bus name) and load a new value.
+old_owner=$(dbus-send --session --print-reply --dest=org.freedesktop.DBus \
+	/org/freedesktop/DBus org.freedesktop.DBus.GetNameOwner \
+	string:org.regolith.Trawl | awk -F'"' '/string/ {print $2}')
+kill "$TRAWLD_PID"
+wait "$TRAWLD_PID" 2>/dev/null || true
+i=0
+while dbus-send --session --print-reply --dest=org.freedesktop.DBus \
+		/org/freedesktop/DBus org.freedesktop.DBus.NameHasOwner \
+		string:org.regolith.Trawl 2>/dev/null | grep -q 'boolean true'; do
+	i=$((i + 1))
+	[ "$i" -le 100 ] || fail "trawld still owns org.regolith.Trawl after kill"
+	sleep 0.1
+done
+start_trawld
+new_owner=$(dbus-send --session --print-reply --dest=org.freedesktop.DBus \
+	/org/freedesktop/DBus org.freedesktop.DBus.GetNameOwner \
+	string:org.regolith.Trawl | awk -F'"' '/string/ {print $2}')
+echo "trawld restarted: bus name owner $old_owner -> $new_owner"
+
+printf '%s: %s\n' "$key" "$after" > "$WORK/resources"
+load_resources "$WORK/resources" "$key"
+
+reload
+name=$(mode_name)
+echo "mode name after trawld restart and reload: $name"
+[ "$name" = "$after" ] || fail "after trawld restarted, set_from_resource gave '$name', not '$after'"
+
+echo "PASS: trawl-restart"

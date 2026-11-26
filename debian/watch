@@ -1,0 +1,7 @@
+Version: 5
+
+Source: https://github.com/swaywm/sway
+Matching-Pattern: refs/tags/v?(\d\S+)
+Mode: git
+Pgpmode: gittag
+Uversionmangle: s/(\d)[_\.\-\+]?((rc|beta|alpha)[\d.]*)$/$1~$2/
