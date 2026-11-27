@@ -1,0 +1,14 @@
+#!/bin/sh
+# 30-keyboard-lock-state: key bindings follow Num Lock as in i3, get_inputs
+# reports xkb_num_lock / xkb_caps_lock with an xkb_locks input event, and
+# xkb_numlock / xkb_capslock work at run time. sway runs nested in Xvfb so
+# that it has a keyboard of its own.
+set -eu
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
+echo "sway under test: $(dpkg-query -W -f '${Package} ${Version}' sway-regolith)"
+if ! python3 debian/tests/keyboard-lock-state.py "$WORK"; then
+	echo "FAIL: keyboard-lock-state"
+	exit 1
+fi
+echo "PASS: keyboard-lock-state"

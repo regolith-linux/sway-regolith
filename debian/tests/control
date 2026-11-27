@@ -59,3 +59,7 @@ Restrictions: allow-stderr
 Tests: move-direction-ppt
 Depends: sway-regolith, dbus, jq, foot, fonts-dejavu-core
 Restrictions: allow-stderr
+
+Tests: keyboard-lock-state
+Depends: sway-regolith, xvfb, python3, python3-xlib, wev
+Restrictions: allow-stderr
