@@ -1,0 +1,115 @@
+#!/bin/sh
+# 27-swaybar-font-height-freeze: a run-time bar font change keeps swaybar
+# drawing, with an explicit height and with the automatic height.
+set -eu
+. debian/tests/lib-headless.sh
+in_dbus_session "$@"
+setup_runtime
+
+# measure FILE: prints "<hash> <bar rows> <status text columns>" for a PPM
+# capture of the top of the output. Rows are the rows of the bar background
+# (#202020) in column 600; status columns are the columns of the right half
+# that hold anything else within those rows.
+measure() {
+	python3 - "$1" <<-'EOF'
+	import hashlib, sys
+	data = open(sys.argv[1], 'rb').read()
+	magic, size, maxval, px = data.split(b'\n', 3)
+	assert magic == b'P6' and maxval == b'255'
+	width, height = map(int, size.split())
+	bg = bytes((0x20, 0x20, 0x20))
+	def pixel(x, y):
+	    i = (y * width + x) * 3
+	    return px[i:i + 3]
+	rows = 0
+	while rows < height and pixel(600, rows) == bg:
+	    rows += 1
+	cols = sum(1 for x in range(width // 2, width)
+	           if any(pixel(x, y) != bg for y in range(rows)))
+	print(hashlib.md5(px[:rows * width * 3]).hexdigest(), rows, cols)
+	EOF
+}
+
+shot() {
+	grim -t ppm -g "0,0 1200x80" "$WORK/shot.ppm"
+	measure "$WORK/shot.ppm"
+}
+
+# observe LABEL: two captures 1.5 s apart while the status counter ticks.
+# Sets ROWS and COLS from the second one and fails if the bar didn't redraw.
+observe() {
+	first=$(shot)
+	sleep 1.5
+	second=$(shot)
+	rest=${second#* }
+	ROWS=${rest%% *} COLS=${rest#* }
+	echo "$1: rows=$ROWS status_cols=$COLS"
+	[ "${first%% *}" != "${second%% *}" ] || fail "$1: the bar stopped redrawing"
+}
+
+# run HEIGHT: one session with "height HEIGHT", or no height line for "auto".
+run() {
+	if [ -n "${SWAY_PID:-}" ]; then
+		kill "$SWAY_PID" 2>/dev/null || true
+		wait "$SWAY_PID" 2>/dev/null || true
+	fi
+	SESSION=$((${SESSION:-0} + 1))
+	export XDG_RUNTIME_DIR="$WORK/run-$SESSION"
+	mkdir -m 700 "$XDG_RUNTIME_DIR"
+	unset SWAYSOCK WAYLAND_DISPLAY
+	height_line=
+	[ "$1" = auto ] || height_line="height $1"
+	cat > "$WORK/status" <<-'EOF'
+	i=0
+	while :; do
+		i=$((i + 1))
+		echo "tick $i"
+		sleep 0.4
+	done
+	EOF
+	cat > "$WORK/config" <<-EOF
+	xwayland disable
+	output HEADLESS-1 resolution 1200x200 position 0 0
+	bar {
+		id bar-0
+		position top
+		font pango:monospace 10
+		$height_line
+		colors {
+			background #202020
+		}
+		status_command sh $WORK/status
+	}
+	EOF
+	start_sway "$WORK/config"
+	for socket in "$XDG_RUNTIME_DIR"/wayland-*; do
+		case "$socket" in *.lock) continue ;; esac
+		export WAYLAND_DISPLAY="${socket##*/}"
+	done
+	sleep 2
+
+	echo "== height $1"
+	observe "start"
+	small_rows=$ROWS small_cols=$COLS
+	swaymsg bar bar-0 font "pango:monospace 24" > /dev/null
+	sleep 1
+	observe "font monospace 24"
+	# The counter gains digits, so compare against 1.5 times the start width.
+	[ $((COLS * 2)) -gt $((small_cols * 3)) ] ||
+		fail "the status text was not redrawn with the larger font"
+	if [ "$1" = auto ]; then
+		[ "$ROWS" -gt "$small_rows" ] || fail "the automatic height did not grow"
+	else
+		[ "$ROWS" -eq "$1" ] || fail "the explicit height changed to $ROWS"
+	fi
+	swaymsg bar bar-0 font "pango:monospace 10" > /dev/null
+	sleep 1
+	observe "font monospace 10"
+	[ "$ROWS" -eq "$small_rows" ] || fail "the bar is $ROWS rows, not $small_rows"
+	[ $((COLS * 2)) -lt $((small_cols * 3)) ] ||
+		fail "the status text was not redrawn with the smaller font"
+}
+
+run 30
+run auto
+echo "OK"
