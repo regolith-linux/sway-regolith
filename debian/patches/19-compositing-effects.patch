@@ -24,12 +24,16 @@ Description: Dim unfocused windows and draw window drop shadows
  the focused colours: a uniform overlay covers its surface and border,
  not its title bar. A shadow is nine pieces of one small template with
  coverage alpha * (1 - d/r)^2 at distance d from the window's box (the
- shadow colour's alpha inside the box when r is 0). Tiled windows cast
- it into a per-workspace layer just below the tiling layer, so it shows
- in the gaps and never on a neighbour; floating windows cast it at the
- bottom of their own tree, over tiled and lower floating windows. A
- shadow is clipped to its output; fullscreen, hidden and scratchpad
- windows cast none. With the defaults nothing changes on screen.
+ shadow colour's alpha inside the box when r is 0). Each piece has a
+ buffer of its own holding only its part of the template (plus a
+ one-pixel border for filtering), because wlroots keeps one texture per
+ scene buffer: a GPU renderer then holds about one template per window,
+ not one per piece. Tiled windows cast it into a per-workspace layer
+ just below the tiling layer, so it shows in the gaps and never on a
+ neighbour; floating windows cast it at the bottom of their own tree,
+ over tiled and lower floating windows. A shadow is clipped to its
+ output; fullscreen, hidden and scratchpad windows cast none. With the
+ defaults nothing changes on screen.
  .
  Also: a reload commits the transaction it arranges instead of waiting
  for the next event; clearing urgency refreshes the window's decorations
@@ -44,7 +48,7 @@ Author: rego-port-bot <339843353+rego-port-bot@users.noreply.github.com>
 Bug: https://github.com/swaywm/sway/issues/3380
 Bug: https://github.com/swaywm/sway/issues/6274
 Forwarded: not-needed
-Last-Update: 2026-11-14
+Last-Update: 2026-11-27
 ---
 diff --git a/common/util.c b/common/util.c
 --- a/common/util.c
@@ -245,7 +249,7 @@ diff --git a/include/sway/tree/container.h b/include/sway/tree/container.h
 +		int radius;
 +		float scale;
 +		float color[4];
-+		int corner, center; // template sections, in buffer pixels
++		int corner; // depth of the corners and edges, in buffer pixels
 +	} shadow;
 +
  	struct wl_listener output_enter;
@@ -741,7 +745,7 @@ diff --git a/sway/desktop/effects.c b/sway/desktop/effects.c
 new file mode 100644
 --- /dev/null
 +++ b/sway/desktop/effects.c
-@@ -0,0 +1,444 @@
+@@ -0,0 +1,496 @@
 +#include <drm_fourcc.h>
 +#include <math.h>
 +#include <stdint.h>
@@ -962,13 +966,48 @@ new file mode 100644
 +	return alpha * falloff * falloff;
 +}
 +
++static const enum shadow_segment shadow_segments[] = {
++	SHADOW_BEFORE, SHADOW_ALONG, SHADOW_AFTER,
++};
++
 +/**
-+ * The shadow of a box is cut into nine pieces of one template image: four
-+ * corners and four edges at their natural size around a uniform middle. The
-+ * edge and middle pieces stretch a single pixel taken from the middle of the
-+ * template, so the image stays small whatever the size of the window.
++ * The shadow of a box is cut from one template image: four corners and four
++ * edges at their natural size around a uniform middle. The edge and middle
++ * pieces stretch a single pixel taken from the middle of the template, so
++ * the images stay small whatever the size of the window.
++ *
++ * Each of the nine pieces has an image of its own holding only its part of
++ * the template: wlroots keeps one texture per scene buffer, so nine pieces
++ * sharing the whole template would cost a GPU renderer nine copies of it.
++ * A part keeps a one-pixel apron of the template pixels next to it on the
++ * sides that face the middle. Filtering a stretched or scaled piece reads
++ * those neighbours, so the piece samples exactly what it would from the
++ * whole template, whether the renderer clamps at the edge of an image or
++ * reads transparency beyond it.
++ *
++ * shadow_segment_crop() gives the part of the template, along one axis, that
++ * the image of a piece in that segment holds.
 + */
-+static bool shadow_render_template(struct sway_container *con, int radius,
++static void shadow_segment_crop(enum shadow_segment segment, int corner,
++		int center, int *start, int *length) {
++	switch (segment) {
++	case SHADOW_BEFORE:
++		*start = 0;
++		*length = corner + 1;
++		break;
++	case SHADOW_ALONG:
++		*start = corner + center / 2 - 1;
++		*length = 3;
++		break;
++	case SHADOW_AFTER:
++	default:
++		*start = corner + center - 1;
++		*length = corner + 1;
++		break;
++	}
++}
++
++static bool shadow_render(struct sway_container *con, int radius,
 +		float scale, const float color[static 4]) {
 +	int corner = (int)lround(radius * scale);
 +	int center = (int)ceilf(3.0f * scale);
@@ -977,53 +1016,73 @@ new file mode 100644
 +	}
 +	int size = 2 * corner + center;
 +
-+	struct pixel_buffer *buffer = pixel_buffer_create(size, size);
-+	if (!buffer) {
-+		sway_log(SWAY_ERROR, "Failed to allocate the shadow buffer");
-+		return false;
-+	}
-+
 +	double *distance = calloc(size, sizeof(double));
 +	if (!distance) {
-+		wlr_buffer_drop(&buffer->base);
++		sway_log(SWAY_ERROR, "Failed to allocate the shadow buffers");
 +		return false;
 +	}
 +	for (int i = 0; i < size; i++) {
 +		distance[i] = shadow_template_distance(i, corner, center, scale);
 +	}
 +
-+	for (int y = 0; y < size; y++) {
-+		uint32_t *row = buffer->data + (size_t)y * size;
-+		for (int x = 0; x < size; x++) {
-+			double d = distance[x] == 0.0 ? distance[y] :
-+				distance[y] == 0.0 ? distance[x] : hypot(distance[x], distance[y]);
-+			float coverage = shadow_coverage(d, radius, color[3]);
-+			row[x] = coverage > 0.0f ? premultiplied_pixel(color, coverage) : 0;
++	struct pixel_buffer *buffers[9] = {0};
++	bool allocated = true;
++	for (int row = 0; row < 3 && allocated; row++) {
++		int y0, height;
++		shadow_segment_crop(shadow_segments[row], corner, center, &y0, &height);
++		for (int col = 0; col < 3; col++) {
++			int x0, width;
++			shadow_segment_crop(shadow_segments[col], corner, center, &x0, &width);
++			struct pixel_buffer *buffer = pixel_buffer_create(width, height);
++			if (!buffer) {
++				allocated = false;
++				break;
++			}
++			buffers[row * 3 + col] = buffer;
++			for (int y = 0; y < height; y++) {
++				uint32_t *pixels = buffer->data + (size_t)y * width;
++				double dy = distance[y0 + y];
++				for (int x = 0; x < width; x++) {
++					double dx = distance[x0 + x];
++					double d = dx == 0.0 ? dy : dy == 0.0 ? dx : hypot(dx, dy);
++					float coverage = shadow_coverage(d, radius, color[3]);
++					pixels[x] = coverage > 0.0f ? premultiplied_pixel(color, coverage) : 0;
++				}
++			}
 +		}
 +	}
 +	free(distance);
 +
-+	for (size_t i = 0; i < sizeof(con->shadow.pieces) / sizeof(con->shadow.pieces[0]); i++) {
-+		wlr_scene_buffer_set_buffer(con->shadow.pieces[i], &buffer->base);
++	for (size_t i = 0; i < sizeof(buffers) / sizeof(buffers[0]); i++) {
++		if (!buffers[i]) {
++			continue;
++		}
++		if (allocated) {
++			wlr_scene_buffer_set_buffer(con->shadow.pieces[i], &buffers[i]->base);
++		}
++		wlr_buffer_drop(&buffers[i]->base);
 +	}
-+	wlr_buffer_drop(&buffer->base);
++	if (!allocated) {
++		sway_log(SWAY_ERROR, "Failed to allocate the shadow buffers");
++		return false;
++	}
 +
 +	con->shadow.radius = radius;
 +	con->shadow.scale = scale;
 +	memcpy(con->shadow.color, color, sizeof(con->shadow.color));
 +	con->shadow.corner = corner;
-+	con->shadow.center = center;
 +	con->shadow.rendered = true;
 +	return true;
 +}
 +
 +/**
 + * One axis of a piece: the logical interval it covers, clipped to [clip_start,
-+ * clip_end), and the template interval it is taken from. Returns false when
-+ * nothing of the piece is left on this axis.
++ * clip_end), and the interval of the piece's image it is taken from (see
++ * shadow_segment_crop()). Returns false when nothing of the piece is left on
++ * this axis.
 + */
 +static bool shadow_piece_axis(enum shadow_segment segment, int start, int length,
-+		int radius, int corner, int center, int clip_start, int clip_end,
++		int radius, int corner, int clip_start, int clip_end,
 +		int *dst_start, int *dst_length, double *src_start, double *src_length) {
 +	int seg_start, seg_length;
 +	switch (segment) {
@@ -1034,16 +1093,18 @@ new file mode 100644
 +		*src_length = corner;
 +		break;
 +	case SHADOW_ALONG:
++		// The middle pixel of three
 +		seg_start = start;
 +		seg_length = length;
-+		*src_start = corner + center / 2;
++		*src_start = 1;
 +		*src_length = 1;
 +		break;
 +	case SHADOW_AFTER:
 +	default:
++		// After the apron
 +		seg_start = start + length;
 +		seg_length = radius;
-+		*src_start = corner + center;
++		*src_start = 1;
 +		*src_length = corner;
 +		break;
 +	}
@@ -1056,7 +1117,7 @@ new file mode 100644
 +	}
 +
 +	if (segment != SHADOW_ALONG) {
-+		// Corner and edge depths map one to one onto the template; the
++		// Corner and edge depths map one to one onto their images; the
 +		// stretched middle is uniform, so it needs no adjustment.
 +		double ratio = *src_length / seg_length;
 +		*src_start += (clipped_start - seg_start) * ratio;
@@ -1122,7 +1183,7 @@ new file mode 100644
 +	if (!con->shadow.rendered || con->shadow.radius != radius ||
 +			con->shadow.scale != scale ||
 +			memcmp(con->shadow.color, color, sizeof(con->shadow.color)) != 0) {
-+		if (!shadow_render_template(con, radius, scale, color)) {
++		if (!shadow_render(con, radius, scale, color)) {
 +			shadow_disable(con);
 +			return;
 +		}
@@ -1157,22 +1218,17 @@ new file mode 100644
 +		.height = output->height,
 +	};
 +
-+	static const enum shadow_segment segments[] = {
-+		SHADOW_BEFORE, SHADOW_ALONG, SHADOW_AFTER,
-+	};
 +	for (int row = 0; row < 3; row++) {
 +		for (int col = 0; col < 3; col++) {
 +			struct wlr_scene_buffer *piece = con->shadow.pieces[row * 3 + col];
 +			int dst_x, dst_y, dst_width, dst_height;
 +			struct wlr_fbox src;
 +			bool visible =
-+				shadow_piece_axis(segments[col], shadow_x, width, radius,
-+					con->shadow.corner, con->shadow.center,
-+					clip.x, clip.x + clip.width,
++				shadow_piece_axis(shadow_segments[col], shadow_x, width, radius,
++					con->shadow.corner, clip.x, clip.x + clip.width,
 +					&dst_x, &dst_width, &src.x, &src.width) &&
-+				shadow_piece_axis(segments[row], shadow_y, height, radius,
-+					con->shadow.corner, con->shadow.center,
-+					clip.y, clip.y + clip.height,
++				shadow_piece_axis(shadow_segments[row], shadow_y, height, radius,
++					con->shadow.corner, clip.y, clip.y + clip.height,
 +					&dst_y, &dst_height, &src.y, &src.height);
 +			wlr_scene_node_set_enabled(&piece->node, visible);
 +			if (!visible) {
