@@ -1,0 +1,140 @@
+#!/bin/sh
+# 28-sticky-floating-output-removal: a sticky floating window whose output is
+# disabled keeps its place relative to the screen on the remaining output,
+# stays visible, and goes back when the output is enabled again; a workspace
+# moved onto an output shows that output's sticky windows. As in i3 4.25.1.
+set -eu
+. debian/tests/lib-headless.sh
+in_dbus_session "$@"
+setup_runtime
+
+JQ_DEFS='
+def win($a): first(.. | objects | select(.app_id? == $a));
+def ws_of($a): first(.. | objects | select(.type? == "workspace")
+	| select(any(.floating_nodes[]?; .app_id == $a)) | .name);
+def output_of($a): first(.nodes[] | select(.type == "output")
+	| select(any(.. | objects; .app_id? == $a)) | .name);
+'
+
+# new_session: restart headless sway with fresh state and two 1280x800
+# outputs side by side.
+new_session() {
+	if [ -n "${SWAY_PID:-}" ]; then
+		kill "$SWAY_PID" 2>/dev/null || true
+		wait "$SWAY_PID" 2>/dev/null || true
+	fi
+	SESSION=$((${SESSION:-0} + 1))
+	export XDG_RUNTIME_DIR="$WORK/run-$SESSION"
+	mkdir -m 700 "$XDG_RUNTIME_DIR"
+	export WLR_HEADLESS_OUTPUTS=2
+	unset SWAYSOCK WAYLAND_DISPLAY
+	cat > "$WORK/config" <<-EOF
+	xwayland disable
+	default_border none
+	default_floating_border none
+	focus_follows_mouse no
+	mouse_warping none
+	output HEADLESS-1 mode --custom 1280x800 position 0 0
+	output HEADLESS-2 mode --custom 1280x800 position 1280 0
+	workspace 1 output HEADLESS-1
+	workspace 2 output HEADLESS-2
+	EOF
+	start_sway "$WORK/config"
+	for socket in "$XDG_RUNTIME_DIR"/wayland-*; do
+		case "$socket" in *.lock) continue ;; esac
+		export WAYLAND_DISPLAY="${socket##*/}"
+	done
+	cmd "workspace 2"
+	cmd "workspace 1"
+}
+
+cmd() {
+	swaymsg "$1" > /dev/null || fail "command failed: $1"
+}
+
+# open NAME: open a foot window whose app_id is NAME and wait for its focus.
+open() {
+	foot --app-id "$1" sleep 600 > /dev/null 2>&1 &
+	i=0
+	until swaymsg -t get_tree -r | jq -e --arg n "$1" \
+			'.. | objects | select(.app_id? == $n and .focused)' > /dev/null; do
+		i=$((i + 1))
+		[ "$i" -le 50 ] || fail "window $1 did not appear"
+		sleep 0.2
+	done
+}
+
+# sticky NAME X Y: open NAME as a sticky floating window at X,Y.
+sticky() {
+	open "$1"
+	cmd "floating enable"
+	cmd "sticky enable"
+	cmd "move absolute position $2 px $3 px"
+	got=$(swaymsg -t get_tree -r | jq -r --arg a "$1" "$JQ_DEFS"'
+		win($a).rect | "\(.x),\(.y)"')
+	[ "$got" = "$2,$3" ] || fail "$1 placed at $got, not $2,$3"
+}
+
+# where NAME: the output, x,y and whether the workspace of NAME is visible
+where() {
+	tree=$(swaymsg -t get_tree -r)
+	ws=$(echo "$tree" | jq -r --arg a "$1" "$JQ_DEFS ws_of(\$a)")
+	visible=$(swaymsg -t get_workspaces -r |
+		jq -r --arg w "$ws" '.[] | select(.name == $w) | .visible')
+	echo "$tree" | jq -r --arg a "$1" --arg v "$visible" "$JQ_DEFS"'
+		output_of($a) + " " + (win($a).rect | "\(.x),\(.y)")
+		+ (if $v == "true" then " visible" else " hidden" end)'
+}
+
+# expect NAME GOT WANT
+expect() {
+	echo "$1: $2"
+	if [ "$2" != "$3" ]; then
+		echo "  expected $3"
+		FAILED="${FAILED:-}${FAILED:+ }$1"
+	fi
+}
+
+# Both outputs have the same size, so a window that keeps its place relative
+# to the screen keeps its position within the output.
+
+# A sticky window on the second output keeps its place on the first one,
+# instead of being centred, and goes back when its output returns.
+new_session
+cmd "workspace 2"
+sticky s1 2040 400
+cmd "output HEADLESS-2 disable"
+expect disable "$(where s1)" "HEADLESS-1 760,400 visible"
+cmd "output HEADLESS-2 enable"
+expect enable "$(where s1)" "HEADLESS-2 2040,400 visible"
+
+# Two sticky windows keep apart.
+new_session
+cmd "workspace 2"
+sticky s1 2040 400
+sticky s2 1380 50
+cmd "output HEADLESS-2 disable"
+expect two-first "$(where s1)" "HEADLESS-1 760,400 visible"
+expect two-second "$(where s2)" "HEADLESS-1 100,50 visible"
+
+# The window's workspace also holds a tiled window, and the focus is on the
+# other output: the workspace moves over hidden, the sticky window stays in
+# view.
+new_session
+cmd "workspace 2"
+open t1
+sticky s1 2040 400
+cmd "workspace 1"
+cmd "output HEADLESS-2 disable"
+expect focus-elsewhere "$(where s1)" "HEADLESS-1 760,400 visible"
+
+# A workspace moved onto the output of a sticky window shows that window.
+new_session
+sticky s1 760 400
+cmd "workspace 2"
+open t1
+cmd "move workspace to output HEADLESS-1"
+expect move-workspace "$(where s1)" "HEADLESS-1 760,400 visible"
+
+[ -z "${FAILED:-}" ] || fail "$FAILED"
+echo "PASS: sticky-output-removal"
