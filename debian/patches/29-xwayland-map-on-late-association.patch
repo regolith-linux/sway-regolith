@@ -1,0 +1,72 @@
+Description: Map Xwayland surfaces associated after their first commit
+ Xwayland's buffer commit (Wayland socket) and the window's
+ WL_SURFACE_SERIAL message (X11 socket) are not ordered. wlroots 0.19
+ maps an associated surface on its next commit only, so a window whose
+ buffer arrived first and which does not draw again stays unmapped for
+ sway although X has mapped it. Docks hit this when they map again with
+ an unchanged geometry, which happens in repeated unmap/map cycles under
+ CPU load: the dock never shows up and reserves no space.
+ .
+ Map such surfaces at the end of each associate handler, as wlroots
+ master (the future 0.21, which sway master requires) now does itself.
+Author: rego-port-bot <339843353+rego-port-bot@users.noreply.github.com>
+Origin: backport, https://gitlab.freedesktop.org/wlroots/wlroots/-/commit/08a9f9f14fc8fd173d1768588699d2e152b6cde6
+Bug: https://codeberg.org/river/river/issues/1494
+Forwarded: not-needed
+Last-Update: 2026-11-27
+---
+ sway/desktop/xwayland.c |   22 ++++++++++++++++++++++
+ 1 file changed, 22 insertions(+)
+
+--- a/sway/desktop/xwayland.c
++++ b/sway/desktop/xwayland.c
+@@ -128,6 +128,25 @@ static void unmanaged_handle_request_act
+ 	seat_set_focus_surface(seat, xsurface->surface, false);
+ }
+ 
++/**
++ * Maps the surface of a window that has just been associated, if it already
++ * holds a buffer. Xwayland's buffer commit (Wayland socket) and the window's
++ * WL_SURFACE_SERIAL message (X11 socket) are not ordered, and wlroots 0.19
++ * maps an associated surface on its next commit only: a window that does not
++ * draw again, such as a dock mapping again with an unchanged geometry, would
++ * stay unmapped although X has mapped it. wlroots 0.21 does this itself
++ * (08a9f9f1 "xwayland/xwm: fix association/map race").
++ *
++ * Mapping runs the map handlers, which may free the caller's state: call
++ * this last.
++ */
++static void xsurface_map_if_committed(struct wlr_xwayland_surface *xsurface) {
++	struct wlr_surface *surface = xsurface->surface;
++	if (surface && !surface->mapped && wlr_surface_has_buffer(surface)) {
++		wlr_surface_map(surface);
++	}
++}
++
+ static void unmanaged_handle_associate(struct wl_listener *listener, void *data) {
+ 	struct sway_xwayland_unmanaged *surface =
+ 		wl_container_of(listener, surface, associate);
+@@ -136,6 +155,7 @@ static void unmanaged_handle_associate(s
+ 	surface->map.notify = unmanaged_handle_map;
+ 	wl_signal_add(&xsurface->surface->events.unmap, &surface->unmap);
+ 	surface->unmap.notify = unmanaged_handle_unmap;
++	xsurface_map_if_committed(xsurface);
+ }
+ 
+ static void unmanaged_handle_dissociate(struct wl_listener *listener, void *data) {
+@@ -528,6 +548,7 @@ static void dock_handle_associate(struct
+ 	dock->map.notify = dock_handle_map;
+ 	wl_signal_add(&xsurface->surface->events.unmap, &dock->unmap);
+ 	dock->unmap.notify = dock_handle_unmap;
++	xsurface_map_if_committed(xsurface);
+ }
+ 
+ static void dock_handle_dissociate(struct wl_listener *listener, void *data) {
+@@ -1211,6 +1232,7 @@ static void handle_associate(struct wl_l
+ 	xwayland_view->unmap.notify = handle_unmap;
+ 	wl_signal_add(&xsurface->surface->events.map, &xwayland_view->map);
+ 	xwayland_view->map.notify = handle_map;
++	xsurface_map_if_committed(xsurface);
+ }
+ 
+ static void handle_dissociate(struct wl_listener *listener, void *data) {

@@ -4,6 +4,10 @@ Depends: sway-regolith
 Tests: no-sway-config
 Depends: sway-regolith
 
+Tests: xwayland-dock-windows
+Depends: sway-regolith, xwayland, python3, python3-xlib
+Restrictions: allow-stderr
+
 Tests: trawl-live
 Depends: sway-regolith, trawld, trawldb, dbus, jq
 Restrictions: allow-stderr

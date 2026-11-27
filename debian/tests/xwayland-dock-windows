@@ -1,0 +1,6 @@
+#!/bin/sh
+# 28-xwayland-dock-windows: X11 dock windows sit at an output edge, reserve
+# their height and never take the focus, as in i3.
+# 29-xwayland-map-on-late-association: docks mapped again always show up.
+set -eu
+exec python3 debian/tests/xwayland-dock-windows.py
