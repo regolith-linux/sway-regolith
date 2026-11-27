@@ -1,0 +1,6 @@
+#!/bin/sh
+# 30-xwayland-window-requests: X11 window requests (configure,
+# _NET_MOVERESIZE_WINDOW, _NET_CLOSE_WINDOW, _NET_WM_STATE_STICKY) and
+# _NET_FRAME_EXTENTS are honoured as in i3 4.25.1.
+set -eu
+exec python3 debian/tests/xwayland-window-requests.py
