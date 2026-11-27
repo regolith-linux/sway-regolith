@@ -1,0 +1,6 @@
+#!/bin/sh
+# 26-xwayland-ewmh-desktops: X11 pagers and tools (wmctrl, xdotool) see the
+# workspaces as EWMH desktops and can switch desktops and move windows, as in
+# i3 4.25.1.
+set -eu
+exec python3 debian/tests/xwayland-ewmh-desktops.py
