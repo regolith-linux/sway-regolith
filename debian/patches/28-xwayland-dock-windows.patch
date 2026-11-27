@@ -23,7 +23,7 @@ Description: Anchor X11 dock windows to output edges, like i3
  (the image capture surface of master's views, and master's
  destroy_layers() call in output_disable()).
 Author: rego-port-bot <339843353+rego-port-bot@users.noreply.github.com>
-Forwarded: https://github.com/swaywm/sway/compare/master...cfsmp3:sway-regolith:ubuntu/xwayland-dock-windows
+Forwarded: https://github.com/swaywm/sway/pull/9353
 Last-Update: 2026-11-27
 ---
  include/sway/scene_descriptor.h |    1 
