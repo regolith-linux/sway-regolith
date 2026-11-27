@@ -1,0 +1,29 @@
+Description: Keep swaybar drawing after a run-time font change with an explicit height
+ With a bar height set, swaymsg bar <id> font ... froze swaybar: the bar
+ kept the frame from before the change, and status updates, workspace
+ changes and further font changes no longer showed. On a font change
+ swaybar reset its height to force a recompute, then asked for the size
+ the bar already had, and sway sends no configure for an unchanged size,
+ so swaybar waited for one forever.
+ .
+ The recompute is now forced only for the automatic height. An explicit
+ height doesn't depend on the font.
+Author: rego-port-bot <339843353+rego-port-bot@users.noreply.github.com>
+Forwarded: https://github.com/swaywm/sway/compare/master...cfsmp3:sway-regolith:swaybar-font-height-freeze
+Last-Update: 2026-11-26
+---
+--- a/swaybar/ipc.c
++++ b/swaybar/ipc.c
+@@ -484,7 +484,11 @@ static bool handle_barconfig_update(struct swaybar *bar, const char *payload,
+ 			destroy_layer_surface(output);
+ 			wl_list_remove(&output->link);
+ 			wl_list_insert(&bar->unused_outputs, &output->link);
+-		} else if (!pango_font_description_equal(oldcfg->font_description, newcfg->font_description)) {
++		} else if (!newcfg->height && !pango_font_description_equal(
++				oldcfg->font_description, newcfg->font_description)) {
++			// Only an automatic height depends on the font. Forcing an
++			// update of an explicit height would request the unchanged
++			// size, which the compositor doesn't answer with a configure.
+ 			output->height = 0;  // force update height
+ 		}
+ 	}
