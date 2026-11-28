@@ -1,0 +1,566 @@
+Description: Route swaybar pointer input like i3bar
+ Status scripts written for i3bar don't behave the same under swaybar:
+ clicks between status blocks fire bar bindings or switch workspaces,
+ blocks without a name never report clicks, `bindsym button1 nop` in the
+ bar block doesn't stop workspace clicks, a `--release` binding stays
+ silent after a workspace click, and click events carry no output_x or
+ output_y, so a script can't place a popup next to the clicked block.
+ .
+ With click events enabled, the status line now owns its area, from the
+ first block to the end of the bar: separators, gaps and edge padding
+ swallow presses and wheel steps. Blocks without a name report clicks
+ (without "name"), and a block's clickable area includes its borders and
+ min_width padding. A press binding replaces a workspace button's
+ built-in action; a release binding runs on top of it. Click events
+ report x and y in the global layout plus output_x and output_y relative
+ to the bar's output, measured from where the bar surface really sits
+ (found through a throwaway xdg_popup, falling back to the gaps).
+ swaybar-protocol(7) documents the new fields.
+ .
+ Backport of the change sent upstream, adapted to 04-dbus-tray: it reuses
+ that patch's xdg_wm_base binding (adding the ping listener) and its
+ hotspot callback arguments (seat, serial).
+Author: rego-port-bot <339843353+rego-port-bot@users.noreply.github.com>
+Forwarded: https://github.com/swaywm/sway/pull/9360
+Last-Update: 2026-11-28
+---
+--- a/include/swaybar/bar.h
++++ b/include/swaybar/bar.h
+@@ -78,7 +78,9 @@ struct swaybar_output {
+ 	bool dirty;
+ 	bool frame_scheduled;
+ 
+-	uint32_t output_height, output_width, output_x, output_y;
++	uint32_t output_height, output_width;
++	// xdg-output logical position; negative for outputs left of/above 0,0
++	int32_t output_x, output_y;
+ };
+ 
+ struct swaybar_workspace {
+@@ -116,4 +118,10 @@ void status_in(int fd, short mask, void
+ 
+ void destroy_layer_surface(struct swaybar_output *output);
+ 
++/**
++ * Finds where the output's bar surface sits on that output, in logical
++ * pixels from the output's top-left corner.
++ */
++void bar_surface_origin(struct swaybar_output *output, double *x, double *y);
++
+ #endif
+--- a/include/swaybar/i3bar.h
++++ b/include/swaybar/i3bar.h
+@@ -29,7 +29,8 @@ struct i3bar_block {
+ void i3bar_block_unref(struct i3bar_block *block);
+ bool i3bar_handle_readable(struct status_line *status);
+ enum hotspot_event_handling i3bar_block_send_click(struct status_line *status,
+-		struct i3bar_block *block, double x, double y, double rx, double ry,
+-		double w, double h, int scale, uint32_t button, bool released);
++		struct i3bar_block *block, double x, double y, double ox, double oy,
++		double rx, double ry, double w, double h, int scale, uint32_t button,
++		bool released);
+ 
+ #endif
+--- a/include/swaybar/input.h
++++ b/include/swaybar/input.h
+@@ -53,6 +53,12 @@ struct swaybar_hotspot {
+ 			double x, double y, uint32_t button, bool released, void *data);
+ 	void (*destroy)(void *data);
+ 	void *data;
++	// The callback is a built-in action of the bar, which a bar binding for
++	// the same pointer button and state takes the place of
++	bool overridable;
++	// The hotspot keeps its area: hotspots beneath it are never tried, and
++	// input it leaves unhandled goes on to the bar bindings and scrolling
++	bool owns_area;
+ };
+ 
+ struct swaybar_scroll_axis {
+--- a/swaybar/bar.c
++++ b/swaybar/bar.c
+@@ -132,6 +132,121 @@ void destroy_layer_surface(struct swayba
+ 	output->frame_scheduled = false;
+ }
+ 
++struct origin_probe {
++	bool configured, dismissed;
++	int32_t x, y;
++};
++
++static void origin_probe_configure(void *data, struct xdg_popup *popup,
++		int32_t x, int32_t y, int32_t width, int32_t height) {
++	struct origin_probe *probe = data;
++	probe->x = x;
++	probe->y = y;
++	probe->configured = true;
++}
++
++static void origin_probe_done(void *data, struct xdg_popup *popup) {
++	struct origin_probe *probe = data;
++	probe->dismissed = true;
++}
++
++static const struct xdg_popup_listener origin_probe_listener = {
++	.configure = origin_probe_configure,
++	.popup_done = origin_probe_done,
++};
++
++/*
++ * Layer surfaces are never told where they were placed, and the configured
++ * gaps do not say it either: other layer surfaces reserving space on the same
++ * edge (more bars, panels) push the bar further in. The compositor does
++ * reveal it through a popup, though. A throwaway popup of the bar surface is
++ * asked for far beyond the output's top-left corner, allowed to slide; the
++ * compositor slides it back to that corner and reports its position relative
++ * to the bar surface, which is minus the bar's origin on the output. The
++ * popup never gets a buffer, so it is never shown.
++ */
++static bool query_surface_origin(struct swaybar_output *output,
++		int32_t *x, int32_t *y) {
++	struct swaybar *bar = output->bar;
++	if (!bar->wm_base || !output->layer_surface) {
++		return false;
++	}
++	// Further than any output can be from its bar
++	const int32_t distance = 1 << 24;
++
++	// The probe has a queue of its own, so that waiting for its reply does
++	// not dispatch the bar's other events from within an input handler
++	struct wl_event_queue *queue = wl_display_create_queue(bar->display);
++	struct wl_compositor *compositor = wl_proxy_create_wrapper(bar->compositor);
++	struct xdg_wm_base *wm_base = wl_proxy_create_wrapper(bar->wm_base);
++	wl_proxy_set_queue((struct wl_proxy *)compositor, queue);
++	wl_proxy_set_queue((struct wl_proxy *)wm_base, queue);
++
++	struct xdg_positioner *positioner = xdg_wm_base_create_positioner(wm_base);
++	xdg_positioner_set_size(positioner, 1, 1);
++	xdg_positioner_set_anchor_rect(positioner, 0, 0, 1, 1);
++	xdg_positioner_set_anchor(positioner, XDG_POSITIONER_ANCHOR_TOP_LEFT);
++	xdg_positioner_set_gravity(positioner, XDG_POSITIONER_GRAVITY_TOP_LEFT);
++	xdg_positioner_set_offset(positioner, -distance, -distance);
++	xdg_positioner_set_constraint_adjustment(positioner,
++			XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_X |
++			XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_Y);
++
++	struct wl_surface *surface = wl_compositor_create_surface(compositor);
++	struct xdg_surface *xdg_surface =
++		xdg_wm_base_get_xdg_surface(wm_base, surface);
++	struct xdg_popup *popup = xdg_surface_get_popup(xdg_surface, NULL,
++			positioner);
++	struct origin_probe probe = {0};
++	xdg_popup_add_listener(popup, &origin_probe_listener, &probe);
++	zwlr_layer_surface_v1_get_popup(output->layer_surface, popup);
++	wl_surface_commit(surface);
++
++	// The configure event is sent once the compositor goes idle, which can be
++	// after the reply to the first roundtrip
++	for (int i = 0; i < 4 && !probe.configured && !probe.dismissed; i++) {
++		if (wl_display_roundtrip_queue(bar->display, queue) == -1) {
++			break;
++		}
++	}
++
++	xdg_popup_destroy(popup);
++	xdg_surface_destroy(xdg_surface);
++	wl_surface_destroy(surface);
++	xdg_positioner_destroy(positioner);
++	wl_proxy_wrapper_destroy(wm_base);
++	wl_proxy_wrapper_destroy(compositor);
++	wl_event_queue_destroy(queue);
++
++	if (!probe.configured || probe.dismissed) {
++		sway_log(SWAY_DEBUG, "Unable to find the bar surface's origin on %s",
++				output->name);
++		return false;
++	}
++	*x = -probe.x;
++	*y = -probe.y;
++	return true;
++}
++
++void bar_surface_origin(struct swaybar_output *output, double *x, double *y) {
++	int32_t origin_x, origin_y;
++	if (query_surface_origin(output, &origin_x, &origin_y)) {
++		*x = origin_x;
++		*y = origin_y;
++		return;
++	}
++	// Without an answer, assume no other surface reserves space on the bar's
++	// edge, so that the bar sits at its gaps
++	struct swaybar_config *config = output->bar->config;
++	*x = config->gaps.left;
++	*y = config->gaps.top;
++	if ((config->position & ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM) &&
++			!(config->position & ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP)) {
++		*y = (double)output->output_height - output->height
++			- config->gaps.bottom;
++	}
++}
++
+ void set_bar_dirty(struct swaybar *bar) {
+ 	struct swaybar_output *output;
+ 	wl_list_for_each(output, &bar->outputs, link) {
+@@ -321,6 +436,15 @@ static void add_xdg_output(struct swayba
+ 		output);
+ }
+ 
++static void wm_base_ping(void *data, struct xdg_wm_base *wm_base,
++		uint32_t serial) {
++	xdg_wm_base_pong(wm_base, serial);
++}
++
++static const struct xdg_wm_base_listener wm_base_listener = {
++	.ping = wm_base_ping,
++};
++
+ static void handle_global(void *data, struct wl_registry *registry,
+ 		uint32_t name, const char *interface, uint32_t version) {
+ 	struct swaybar *bar = data;
+@@ -367,6 +491,7 @@ static void handle_global(void *data, st
+ 			&wp_cursor_shape_manager_v1_interface, 1);
+ 	} else if (strcmp(interface, xdg_wm_base_interface.name) == 0) {
+ 		bar->wm_base = wl_registry_bind(registry, name, &xdg_wm_base_interface, 1);
++		xdg_wm_base_add_listener(bar->wm_base, &wm_base_listener, NULL);
+ 	}
+ }
+ 
+--- a/swaybar/i3bar.c
++++ b/swaybar/i3bar.c
+@@ -267,10 +267,12 @@ bool i3bar_handle_readable(struct status
+ }
+ 
+ enum hotspot_event_handling i3bar_block_send_click(struct status_line *status,
+-		struct i3bar_block *block, double x, double y, double rx, double ry,
+-		double w, double h, int scale, uint32_t button, bool released) {
+-	sway_log(SWAY_DEBUG, "block %s clicked", block->name);
+-	if (!block->name || !status->click_events) {
++		struct i3bar_block *block, double x, double y, double ox, double oy,
++		double rx, double ry, double w, double h, int scale, uint32_t button,
++		bool released) {
++	sway_log(SWAY_DEBUG, "block %s clicked",
++			block->name ? block->name : "(unnamed)");
++	if (!status->click_events) {
+ 		return HOTSPOT_PROCESS;
+ 	}
+ 	if (released) {
+@@ -280,8 +282,10 @@ enum hotspot_event_handling i3bar_block_
+ 	}
+ 
+ 	struct json_object *event_json = json_object_new_object();
+-	json_object_object_add(event_json, "name",
+-			json_object_new_string(block->name));
++	if (block->name) {
++		json_object_object_add(event_json, "name",
++				json_object_new_string(block->name));
++	}
+ 	if (block->instance) {
+ 		json_object_object_add(event_json, "instance",
+ 				json_object_new_string(block->instance));
+@@ -295,6 +299,8 @@ enum hotspot_event_handling i3bar_block_
+ 		json_object_object_add(event_json, "y", json_object_new_double(y));
+ 		json_object_object_add(event_json, "relative_x", json_object_new_double(rx));
+ 		json_object_object_add(event_json, "relative_y", json_object_new_double(ry));
++		json_object_object_add(event_json, "output_x", json_object_new_double(ox));
++		json_object_object_add(event_json, "output_y", json_object_new_double(oy));
+ 		json_object_object_add(event_json, "width", json_object_new_double(w));
+ 		json_object_object_add(event_json, "height", json_object_new_double(h));
+ 	} else {
+@@ -302,6 +308,8 @@ enum hotspot_event_handling i3bar_block_
+ 		json_object_object_add(event_json, "y", json_object_new_int(y));
+ 		json_object_object_add(event_json, "relative_x", json_object_new_int(rx));
+ 		json_object_object_add(event_json, "relative_y", json_object_new_int(ry));
++		json_object_object_add(event_json, "output_x", json_object_new_int(ox));
++		json_object_object_add(event_json, "output_y", json_object_new_int(oy));
+ 		json_object_object_add(event_json, "width", json_object_new_int(w));
+ 		json_object_object_add(event_json, "height", json_object_new_int(h));
+ 	}
+--- a/swaybar/input.c
++++ b/swaybar/input.c
+@@ -173,32 +173,58 @@ static void wl_pointer_motion(void *data
+ #endif
+ }
+ 
+-static bool check_bindings(struct swaybar *bar, uint32_t button,
+-		uint32_t state) {
+-	bool released = state == WL_POINTER_BUTTON_STATE_RELEASED;
++static struct swaybar_binding *find_binding(struct swaybar *bar,
++		uint32_t button, bool released) {
+ 	for (int i = 0; i < bar->config->bindings->length; i++) {
+ 		struct swaybar_binding *binding = bar->config->bindings->items[i];
+ 		if (binding->button == button && binding->release == released) {
+-			ipc_execute_binding(bar, binding);
+-			return true;
++			return binding;
+ 		}
+ 	}
++	return NULL;
++}
++
++static bool check_bindings(struct swaybar *bar, uint32_t button,
++		uint32_t state) {
++	bool released = state == WL_POINTER_BUTTON_STATE_RELEASED;
++	struct swaybar_binding *binding = find_binding(bar, button, released);
++	if (binding) {
++		ipc_execute_binding(bar, binding);
++		return true;
++	}
+ 	return false;
+ }
+ 
++/**
++ * Passes the event to the hotspots under (x, y) until one handles it. For
++ * pointer input, hotspots holding a built-in action are skipped when a bar
++ * binding exists for the button, so that the binding runs in their place;
++ * bar bindings never apply to touch taps. The walk ends at a hotspot that
++ * owns its area, whether or not it handled the event.
++ */
+ static bool process_hotspots(struct swaybar_output *output,
+ 		struct swaybar_seat *seat, uint32_t serial,
+-		double x, double y, uint32_t button, uint32_t state) {
++		double x, double y, uint32_t button, uint32_t state, bool pointer) {
+ 	bool released = state == WL_POINTER_BUTTON_STATE_RELEASED;
+ 	struct swaybar_hotspot *hotspot;
+ 	wl_list_for_each(hotspot, &output->hotspots, link) {
+ 		if (x >= hotspot->x && y >= hotspot->y
+ 				&& x < hotspot->x + hotspot->width
+ 				&& y < hotspot->y + hotspot->height) {
++			if (pointer && hotspot->overridable &&
++					find_binding(output->bar, button, released)) {
++				if (hotspot->owns_area) {
++					return false;
++				}
++				continue;
++			}
+ 			if (HOTSPOT_IGNORE == hotspot->callback(output, hotspot, seat, serial, x, y,
+ 					button, released, hotspot->data)) {
+ 				return true;
+ 			}
++			if (hotspot->owns_area) {
++				return false;
++			}
+ 		}
+ 	}
+ 
+@@ -221,7 +247,8 @@ static void wl_pointer_button(void *data
+ 		return;
+ 	}
+ 
+-	if (process_hotspots(output, seat, serial, pointer->x, pointer->y, button, state)) {
++	if (process_hotspots(output, seat, serial, pointer->x, pointer->y, button,
++			state, true)) {
+ 		return;
+ 	}
+ 
+@@ -275,7 +302,8 @@ static void process_discrete_scroll(stru
+ 		struct swaybar_output *output, struct swaybar_pointer *pointer,
+ 		uint32_t axis, wl_fixed_t value) {
+ 	uint32_t button = wl_axis_to_button(axis, value);
+-	if (process_hotspots(output, seat, 0, pointer->x, pointer->y, button, WL_POINTER_BUTTON_STATE_PRESSED)) {
++	if (process_hotspots(output, seat, 0, pointer->x, pointer->y, button,
++			WL_POINTER_BUTTON_STATE_PRESSED, true)) {
+ 		// (Currently hotspots don't do anything on release events, so no need to emit one)
+ 		return;
+ 	}
+@@ -469,7 +497,8 @@ static void wl_touch_up(void *data, stru
+ 	}
+ 	if (time - slot->time < 500) {
+ 		// Tap, treat it like a pointer click
+-		process_hotspots(slot->output, seat, serial, slot->x, slot->y, BTN_LEFT, WL_POINTER_BUTTON_STATE_PRESSED);
++		process_hotspots(slot->output, seat, serial, slot->x, slot->y, BTN_LEFT,
++			WL_POINTER_BUTTON_STATE_PRESSED, false);
+ 		// (Currently hotspots don't do anything on release events, so no need to emit one)
+ 	}
+ 	slot->output = NULL;
+--- a/swaybar/render.c
++++ b/swaybar/render.c
+@@ -164,7 +164,19 @@ static enum hotspot_event_handling block
+ 		double x, double y, uint32_t button, bool released, void *data) {
+ 	struct i3bar_block *block = data;
+ 	struct status_line *status = output->bar->status;
+-	return i3bar_block_send_click(status, block, x, y,
++
++	// Only presses are reported, so only they need the bar's position
++	double output_x = x, output_y = y;
++	if (!released && status->click_events) {
++		double origin_x, origin_y;
++		bar_surface_origin(output, &origin_x, &origin_y);
++		output_x += origin_x;
++		output_y += origin_y;
++	}
++
++	return i3bar_block_send_click(status, block,
++			output->output_x + output_x, output->output_y + output_y,
++			output_x, output_y,
+ 			x - (double)hotspot->x,
+ 			y - (double)hotspot->y,
+ 			(double)hotspot->width,
+@@ -252,7 +264,8 @@ static uint32_t render_status_block(stru
+ 		struct swaybar_hotspot *hotspot = calloc(1, sizeof(struct swaybar_hotspot));
+ 		hotspot->x = *x;
+ 		hotspot->y = 0;
+-		hotspot->width = width;
++		// The whole drawn block: min_width padding, borders and their margins
++		hotspot->width = block_width;
+ 		hotspot->height = height;
+ 		hotspot->callback = block_hotspot_callback;
+ 		hotspot->destroy = i3bar_block_unref_callback;
+@@ -542,6 +555,15 @@ static uint32_t render_status_line(struc
+ 	return 0;
+ }
+ 
++static enum hotspot_event_handling binding_mode_indicator_hotspot_callback(
++		struct swaybar_output *output, struct swaybar_hotspot *hotspot,
++		struct swaybar_seat *seat, uint32_t serial,
++		double x, double y, uint32_t button, bool released, void *data) {
++	// The indicator has no action of its own: input over it goes to the bar
++	// bindings and scrolling, never to a status block drawn beneath it
++	return HOTSPOT_PROCESS;
++}
++
+ static uint32_t render_binding_mode_indicator(struct render_context *ctx,
+ 		double x) {
+ 	struct swaybar_output *output = ctx->output;
+@@ -597,6 +619,15 @@ static uint32_t render_binding_mode_indi
+ 	choose_text_aa_mode(ctx, config->colors.binding_mode.text);
+ 	render_text(cairo, config->font_description, 1, output->bar->mode_pango_markup,
+ 			"%s", mode);
++
++	struct swaybar_hotspot *hotspot = calloc(1, sizeof(struct swaybar_hotspot));
++	hotspot->x = x;
++	hotspot->y = 0;
++	hotspot->width = width;
++	hotspot->height = height;
++	hotspot->callback = binding_mode_indicator_hotspot_callback;
++	hotspot->owns_area = true;
++	wl_list_insert(&output->hotspots, &hotspot->link);
+ 	return output->height;
+ }
+ 
+@@ -604,14 +635,11 @@ static enum hotspot_event_handling works
+ 		struct swaybar_output *output, struct swaybar_hotspot *hotspot,
+ 		struct swaybar_seat *seat, uint32_t serial,
+ 		double x, double y, uint32_t button, bool released, void *data) {
+-	if (button != BTN_LEFT) {
++	if (button != BTN_LEFT || released) {
++		// Release events fall through so that release bindings still run on
++		// top of the built-in action of the press
+ 		return HOTSPOT_PROCESS;
+ 	}
+-	if (released) {
+-		// Since we handle the pressed event, also handle the released event
+-		// to block it from falling through to a binding in the bar
+-		return HOTSPOT_IGNORE;
+-	}
+ 	ipc_send_workspace_command(output->bar, (const char *)data);
+ 	return HOTSPOT_IGNORE;
+ }
+@@ -687,12 +715,43 @@ static uint32_t render_workspace_button(
+ 	hotspot->callback = workspace_hotspot_callback;
+ 	hotspot->destroy = free;
+ 	hotspot->data = strdup(ws->name);
++	hotspot->overridable = true;
++	// A long status line may reach beneath the buttons; they keep their area
++	hotspot->owns_area = true;
+ 	wl_list_insert(&output->hotspots, &hotspot->link);
+ 
+ 	*x += width;
+ 	return output->height;
+ }
+ 
++static enum hotspot_event_handling status_line_hotspot_callback(
++		struct swaybar_output *output, struct swaybar_hotspot *hotspot,
++		struct swaybar_seat *seat, uint32_t serial,
++		double x, double y, uint32_t button, bool released, void *data) {
++	// Input landing in the status line's area but not on a block (separators,
++	// gaps, edge padding) is swallowed, as in i3bar
++	return HOTSPOT_IGNORE;
++}
++
++static void add_status_line_hotspot(struct swaybar_output *output, double x) {
++	struct status_line *status = output->bar->status;
++	if (!status || status->protocol != PROTOCOL_I3BAR ||
++			!status->click_events || x >= output->width) {
++		return;
++	}
++	// While click events are enabled, the status line owns the region from
++	// its first block to the end of the bar, across the full bar height
++	struct swaybar_hotspot *hotspot = calloc(1, sizeof(struct swaybar_hotspot));
++	hotspot->x = x;
++	hotspot->y = 0;
++	hotspot->width = output->width - hotspot->x;
++	hotspot->height = output->height;
++	hotspot->callback = status_line_hotspot_callback;
++	// Appended so that blocks, tray items and workspace buttons are matched
++	// before it
++	wl_list_insert(output->hotspots.prev, &hotspot->link);
++}
++
+ static uint32_t render_to_cairo(struct render_context *ctx) {
+ 	cairo_t *cairo = ctx->cairo;
+ 	struct swaybar_output *output = ctx->output;
+@@ -716,9 +775,14 @@ static uint32_t render_to_cairo(struct r
+ 		max_height = h > max_height ? h : max_height;
+ 	}
+ #endif
++	double status_line_x = output->width;
+ 	if (bar->status) {
++		double status_line_end = x;
+ 		uint32_t h = render_status_line(ctx, &x);
+ 		max_height = h > max_height ? h : max_height;
++		if (x < status_line_end) {
++			status_line_x = x;
++		}
+ 	}
+ 	x = 0;
+ 	if (config->workspace_buttons) {
+@@ -731,6 +795,11 @@ static uint32_t render_to_cairo(struct r
+ 	if (config->binding_mode_indicator) {
+ 		uint32_t h = render_binding_mode_indicator(ctx, x);
+ 		max_height = h > max_height ? h : max_height;
++		x += predict_binding_mode_indicator_length(cairo, output);
++	}
++	if (status_line_x < output->width) {
++		add_status_line_hotspot(output,
++				status_line_x > x ? status_line_x : x);
+ 	}
+ 
+ 	return max_height > output->height ? max_height : output->height;
+--- a/swaybar/swaybar-protocol.7.scd
++++ b/swaybar/swaybar-protocol.7.scd
+@@ -212,10 +212,10 @@ the following properties:
+ :  The instance of the block, if set
+ |- x
+ :  integer
+-:  The x location that the click occurred at
++:  The x location that the click occurred at, in the global output layout
+ |- y
+ :  integer
+-:  The y location that the click occurred at
++:  The y location that the click occurred at, in the global output layout
+ |- button
+ :  integer
+ :  The x11 button number for the click. If the button does not have an x11
+@@ -229,6 +229,14 @@ the following properties:
+ |- relative_y
+ :  integer
+ :  The y location of the click relative to the top-left of the block
++|- output_x
++:  integer
++:  The x location of the click relative to the top-left of the output the
++   bar is on
++|- output_y
++:  integer
++:  The y location of the click relative to the top-left of the output the
++   bar is on
+ |- width
+ :  integer
+ :  The width of the block in pixels
+@@ -253,6 +261,8 @@ the following properties:
+ 	"event": 274,
+ 	"relative_x": 100,
+ 	"relative_y": 8,
++	"output_x": 1900,
++	"output_y": 10,
+ 	"width": 120,
+ 	"height": 18
+ }
