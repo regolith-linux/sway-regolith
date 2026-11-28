@@ -1,0 +1,234 @@
+#!/bin/sh
+# 19-compositing-effects: unfocused windows are dimmed and windows cast drop
+# shadows, on the software renderer, following focus, urgency, moves and
+# reloads; with the defaults nothing changes on screen.
+# Window rectangles and pixels are split into fields with set -- on purpose.
+# shellcheck disable=SC2046,SC2086
+set -eu
+. debian/tests/lib-headless.sh
+in_dbus_session "$@"
+setup_runtime
+export WLR_HEADLESS_OUTPUTS=1
+
+# Grey background, 4px borders in a colour of their own, no title bars.
+cat > "$WORK/config" <<-'EOF'
+xwayland disable
+focus_follows_mouse no
+mouse_warping none
+output HEADLESS-1 mode --custom 800x600 position 0 0 bg #808080 solid_color
+default_border pixel 4
+default_floating_border pixel 4
+client.focused #0000ff #0000ff #ffffff #0000ff #0000ff
+client.unfocused #0000ff #0000ff #ffffff #0000ff #0000ff
+client.focused_inactive #0000ff #0000ff #ffffff #0000ff #0000ff
+client.urgent #0000ff #0000ff #ffffff #0000ff #0000ff
+EOF
+start_sway "$WORK/config"
+for socket in "$XDG_RUNTIME_DIR"/wayland-*; do
+	case "$socket" in *.lock) continue ;; esac
+	export WAYLAND_DISPLAY="${socket##*/}"
+done
+
+cmd() {
+	swaymsg -- "$1" > /dev/null || fail "command failed: $1"
+}
+
+# open NAME RRGGBB [FOOT_OPTION...]: open a foot window whose app_id is NAME,
+# painted RRGGBB all over (no padding, cursor hidden, nothing printed).
+open() {
+	name=$1 color=$2
+	shift 2
+	LC_ALL=C.UTF-8 foot --app-id "$name" -o "colors.background=$color" \
+		-o main.pad=0x0 "$@" sh -c 'printf "\033[?25l"; exec sleep infinity' > /dev/null 2>&1 &
+	i=0
+	until swaymsg -t get_tree -r | jq -e --arg n "$name" \
+			'.. | objects | select(.app_id? == $n and .focused)' > /dev/null; do
+		i=$((i + 1))
+		[ "$i" -le 50 ] || fail "window $name did not appear"
+		sleep 0.2
+	done
+}
+
+# rect NAME: x y width height of the window NAME (borders included), once
+# it has stayed the same for half a second
+rect() {
+	last='' i=0
+	while :; do
+		now=$(swaymsg -t get_tree -r | jq -r --arg n "$1" \
+			'first(.. | objects | select(.app_id? == $n))
+			| "\(.rect.x) \(.rect.y) \(.rect.width) \(.rect.height)"')
+		[ "$now" != "$last" ] || break
+		last=$now i=$((i + 1))
+		[ "$i" -le 20 ] || fail "window $1 does not settle"
+		sleep 0.5
+	done
+	echo "$now"
+}
+
+# pixel X Y: "R G B" on screen at X,Y
+pixel() {
+	grim -t ppm -g "$1,$2 1x1" - | tail -c 3 | od -An -tu1 | xargs
+}
+
+# expect WHAT X Y R G B [TOLERANCE]: the pixel at X,Y is R G B, give or
+# take TOLERANCE (default 2) in each channel. Waits up to 3 s for it.
+expect() {
+	what=$1 x=$2 y=$3 r=$4 g=$5 b=$6 tol=${7:-2}
+	i=0
+	while :; do
+		got=$(pixel "$x" "$y")
+		set -- $got
+		if [ $(($1 - r)) -le "$tol" ] && [ $((r - $1)) -le "$tol" ] &&
+				[ $(($2 - g)) -le "$tol" ] && [ $((g - $2)) -le "$tol" ] &&
+				[ $(($3 - b)) -le "$tol" ] && [ $((b - $3)) -le "$tol" ]; then
+			echo "$what: $got"
+			return 0
+		fi
+		i=$((i + 1))
+		[ "$i" -le 30 ] || fail "$what at $x,$y: got $got, expected $r $g $b"
+		sleep 0.1
+	done
+}
+
+# Two tiled windows side by side; b is focused.
+open a ffffff
+open b ffffff
+set -- $(rect a); ax=$1 ay=$2 aw=$3 ah=$4
+set -- $(rect b); bx=$1 by=$2 bw=$3 bh=$4
+acx=$((ax + aw / 2)) acy=$((ay + ah / 2))
+bcx=$((bx + bw / 2)) bcy=$((by + bh / 2))
+
+echo "-- defaults: nothing is dimmed"
+expect "a, unfocused" $acx $acy 255 255 255 1
+expect "a's border" $((ax + 1)) $acy 0 0 255 1
+expect "b, focused" $bcx $bcy 255 255 255 1
+
+echo "-- default_dim_inactive 0.5: the unfocused window and its border"
+cmd "default_dim_inactive 0.5"
+expect "a, unfocused" $acx $acy 128 128 128
+expect "a's border" $((ax + 1)) $acy 0 0 128
+expect "b, focused" $bcx $bcy 255 255 255 1
+cmd "focus left"
+expect "a, focused" $acx $acy 255 255 255 1
+expect "b, unfocused" $bcx $bcy 128 128 128
+
+echo "-- the focused workspace: no tiled window is unfocused"
+cmd "focus parent"
+expect "a, workspace focused" $acx $acy 255 255 255 1
+expect "b, workspace focused" $bcx $bcy 255 255 255 1
+cmd "focus child"
+
+echo "-- colours and urgency"
+cmd "dim_inactive_colors.unfocused #ff000080"
+expect "b, #ff000080" $bcx $bcy 255 191 191
+cmd "[app_id=b] urgent enable"
+expect "b, urgent" $bcx $bcy 200 128 128
+cmd "[app_id=b] urgent disable"
+expect "b, no longer urgent" $bcx $bcy 255 191 191
+
+echo "-- a window's own amount survives global changes and reloads"
+cmd "[app_id=b] dim_inactive 1"
+expect "b, own amount 1" $bcx $bcy 255 128 128
+cmd "default_dim_inactive 0.25"
+expect "b, own amount 1 kept" $bcx $bcy 255 128 128
+cmd reload
+expect "b, own amount 1 after reload" $bcx $bcy 0 0 0
+expect "a, focused" $acx $acy 255 255 255 1
+cmd "[app_id=b] dim_inactive 0"
+expect "b, own amount 0" $bcx $bcy 255 255 255 1
+
+echo "-- invalid values change nothing"
+cmd "default_dim_inactive 0.5"
+for bad in "[app_id=b] dim_inactive -1" "default_dim_inactive 2" \
+		"shadow_offset 1 2147483648"; do
+	if swaymsg -- "$bad" > /dev/null 2>&1; then
+		fail "accepted: $bad"
+	fi
+done
+expect "b, own amount 0 kept" $bcx $bcy 255 255 255 1
+
+echo "-- a floating window's shadow, on another workspace"
+cmd "default_dim_inactive 0"
+cmd "shadows enable"
+cmd "shadow_blur_radius 10"
+cmd "shadow_color #000000ff"
+cmd "for_window [app_id=\"^f\"] floating enable"
+cmd "workspace 2"
+open f ffffff --window-size-pixels=200x100
+cmd "[app_id=\"^f\$\"] move absolute position 300 200"
+set -- $(rect f); fx=$1 fy=$2 fw=$3 fh=$4
+right=$((fx + fw)) bottom=$((fy + fh)) mx=$((fx + fw / 2)) my=$((fy + fh / 2))
+# a = (1 - d/10)^2 at d = 5.5 (the pixel's centre): 0.2025; 128 * (1 - a) = 102
+expect "shadow, 5 px right" $((right + 5)) $my 102 102 102 4
+expect "shadow, 5 px below" $mx $((bottom + 5)) 102 102 102 4
+expect "shadow, 5 px left" $((fx - 6)) $my 102 102 102 4
+expect "no shadow 10 px right" $((right + 10)) $my 128 128 128 1
+# corners are rounded: d = hypot(5.5, 5.5) = 7.78, a = 0.0494, 122
+expect "shadow, corner" $((right + 5)) $((bottom + 5)) 122 122 122 4
+expect "window above its shadow" $mx $my 255 255 255 1
+expect "border above its shadow" $((right - 2)) $my 0 0 255 1
+
+echo "-- offset and radius 0; the shadow follows moves"
+cmd "shadow_blur_radius 0"
+cmd "shadow_offset 20 10"
+expect "shadow, offset" $((right + 10)) $((bottom + 5)) 0 0 0 4
+expect "no shadow above the offset box" $((right + 10)) $((fy + 5)) 128 128 128 1
+cmd "[app_id=\"^f\$\"] move absolute position 100 100"
+set -- $(rect f); fx=$1 fy=$2
+expect "old shadow gone" $((right + 10)) $((bottom + 5)) 128 128 128 1
+right=$((fx + fw)) bottom=$((fy + fh))
+expect "shadow at the new place" $((right + 10)) $((bottom + 5)) 0 0 0 4
+
+echo "-- the unfocused shadow colour; floating shadows stack"
+cmd "shadow_inactive_color #ff0000ff"
+cmd "[app_id=\"^f\$\"] move absolute position 400 250"
+set -- $(rect f); fx=$1 fy=$2
+right=$((fx + fw)) bottom=$((fy + fh))
+open f2 00ff00 --window-size-pixels=200x100
+# f2 lies above f, up and to the left; its shadow, moved by 20 10, reaches
+# into f to the right of f2
+cmd "[app_id=\"^f2\$\"] move absolute position $((fx - 150)) $((fy - 50))"
+set -- $(rect f2); gx=$1 gy=$2 gw=$3 gh=$4
+inside_f=$((gx + gw + 10))
+expect "f's shadow, unfocused" $((fx + 30)) $((bottom + 5)) 255 0 0 4
+expect "f2's shadow over f" $inside_f $((fy + 20)) 0 0 0 4
+cmd "[app_id=\"^f\$\"] focus"
+expect "f, now above f2's shadow" $inside_f $((fy + 20)) 255 255 255 1
+expect "f's shadow, focused" $((right + 10)) $((bottom + 5)) 0 0 0 4
+expect "f2's shadow, unfocused" $((gx + 30)) $((gy + gh + 5)) 255 0 0 4
+
+echo "-- tiled shadows: in the gaps, under every tiled window"
+cmd "shadow_offset 0 0"
+cmd "shadow_blur_radius 10"
+cmd "shadow_inactive_color #000000ff"
+cmd "workspace 3"
+cmd "gaps inner current set 20"
+open t1 ffffff
+open t2 ffffff
+set -- $(rect t1); x1=$1 y1=$2 w1=$3 h1=$4
+set -- $(rect t2); x2=$1
+gap=$((x1 + w1))
+[ $((x2 - gap)) -eq 20 ] || fail "unexpected gap: t1 ends at $gap, t2 starts at $x2"
+# two shadows meet in the gap: 5.5 px from t1, 14.5 px from t2 (none)
+expect "shadow in the gap" $((gap + 5)) $((y1 + h1 / 2)) 102 102 102 4
+expect "t2 not darkened by t1's shadow" $((x2 + 2)) $((y1 + h1 / 2)) 0 0 255 1
+cmd "fullscreen enable"
+expect "no shadow behind a fullscreen window" $((gap + 5)) $((y1 + h1 / 2)) 255 255 255 1
+cmd "fullscreen disable"
+
+echo "-- a floating split container goes away while its window casts a shadow"
+cmd "workspace 4"
+open s ffffff --window-size-pixels=200x100
+cmd "[app_id=\"^s\$\"] floating enable, splitv"
+for step in "move scratchpad" "scratchpad show" "move container to workspace 5" \
+		"move container to workspace 4" "kill"; do
+	cmd "[app_id=\"^s\$\"] $step"
+	swaymsg -t get_version > /dev/null || fail "sway died after '$step'"
+done
+cmd "workspace 3"
+
+echo "-- shadows disable"
+cmd "shadows disable"
+expect "no shadow" $((gap + 5)) $((y1 + h1 / 2)) 128 128 128 1
+
+echo "PASS: compositing-effects"

@@ -1,0 +1,1679 @@
+Description: Dim unfocused windows and draw window drop shadows
+ In the X11 session picom dims unfocused windows and draws shadows under
+ them. The sway session had neither: the window with keyboard focus
+ looked like every other window, a floating window had no edge against
+ what lay underneath, and the SwayFX configuration lines for these
+ effects made sway -C fail as unknown commands.
+ .
+ New settings, with SwayFX's names, arguments and defaults:
+   default_dim_inactive <0.0-1.0>               (0.0)
+   dim_inactive <0.0-1.0>                       per window: criteria, for_window
+   dim_inactive_colors.unfocused <#RRGGBB[AA]>  (#000000FF)
+   dim_inactive_colors.urgent <#RRGGBB[AA]>     (#900000FF)
+   shadows enable|disable                       (disable)
+   shadows_on_csd enable|disable                (disable)
+   shadow_blur_radius <0-99>                    (20)
+   shadow_color <#RRGGBB[AA]>                   (#0000007F)
+   shadow_inactive_color <#RRGGBB[AA]>          (#0000007F)
+   shadow_offset <x> <y>                        (0 0)
+ .
+ SwayFX draws these in its own GLES2 renderer (scenefx). Here both are
+ plain wlroots scene buffers holding small CPU-rendered images, so they
+ work with every renderer, pixman included, and none of them takes
+ pointer input. A window is dimmed when its border would not be drawn in
+ the focused colours: a uniform overlay covers its surface and border,
+ not its title bar. A shadow is nine pieces of one small template with
+ coverage alpha * (1 - d/r)^2 at distance d from the window's box (the
+ shadow colour's alpha inside the box when r is 0). Each piece has a
+ buffer of its own holding only its part of the template (plus a
+ one-pixel border for filtering), because wlroots keeps one texture per
+ scene buffer: a GPU renderer then holds about one template per window,
+ not one per piece. Tiled windows cast it into a per-workspace layer
+ just below the tiling layer, so it shows in the gaps and never on a
+ neighbour; floating windows cast it at the bottom of their own tree,
+ over tiled and lower floating windows. A shadow is clipped to its
+ output; fullscreen, hidden and scratchpad windows cast none. With the
+ defaults nothing changes on screen.
+ .
+ Also: a reload commits the transaction it arranges instead of waiting
+ for the next event; clearing urgency refreshes the window's decorations
+ at once, as setting it does; and for_window checks the argument of
+ dim_inactive when the rule is read, so sway -C fails on a rule that
+ could never apply.
+ .
+ Not forwarded: sway declines compositing effects
+ (https://github.com/swaywm/sway/issues/3380,
+ https://github.com/swaywm/sway/pull/4254).
+Author: rego-port-bot <339843353+rego-port-bot@users.noreply.github.com>
+Bug: https://github.com/swaywm/sway/issues/3380
+Bug: https://github.com/swaywm/sway/issues/6274
+Forwarded: not-needed
+Last-Update: 2026-11-27
+---
+diff --git a/common/util.c b/common/util.c
+--- a/common/util.c
++++ b/common/util.c
+@@ -1,5 +1,7 @@
+ #include <ctype.h>
++#include <errno.h>
+ #include <fcntl.h>
++#include <limits.h>
+ #include <math.h>
+ #include <time.h>
+ #include <stdlib.h>
+@@ -30,6 +32,13 @@ bool parse_color(const char *color, uint32_t *result) {
+ 	return true;
+ }
+ 
++bool parse_hex_color(const char *color, uint32_t *result) {
++	if (color[0] != '#') {
++		return false;
++	}
++	return parse_color(color, result);
++}
++
+ void color_to_rgba(float dest[static 4], uint32_t color) {
+ 	dest[0] = ((color >> 24) & 0xff) / 255.0;
+ 	dest[1] = ((color >> 16) & 0xff) / 255.0;
+@@ -64,6 +73,22 @@ float parse_float(const char *value) {
+ 	return flt;
+ }
+ 
++bool parse_int(const char *value, int *result) {
++	if (!isdigit((unsigned char)value[0]) &&
++			!((value[0] == '-' || value[0] == '+') &&
++				isdigit((unsigned char)value[1]))) {
++		return false;
++	}
++	errno = 0;
++	char *end;
++	long parsed = strtol(value, &end, 10);
++	if (*end || errno || parsed < INT_MIN || parsed > INT_MAX) {
++		return false;
++	}
++	*result = (int)parsed;
++	return true;
++}
++
+ enum movement_unit parse_movement_unit(const char *unit) {
+ 	if (strcasecmp(unit, "px") == 0) {
+ 		return MOVEMENT_UNIT_PX;
+diff --git a/include/sway/commands.h b/include/sway/commands.h
+--- a/include/sway/commands.h
++++ b/include/sway/commands.h
+@@ -78,6 +78,13 @@ struct cmd_results *config_commands_command(char *exec);
+  * Allocates a cmd_results object.
+  */
+ struct cmd_results *cmd_results_new(enum cmd_status status, const char *error, ...) _SWAY_ATTRIB_PRINTF(2, 3);
++
++/**
++ * Parse the single amount argument of default_dim_inactive or dim_inactive.
++ * Returns an error, or NULL after storing the amount in value.
++ */
++struct cmd_results *dim_inactive_parse(const char *name, int argc, char **argv,
++		float *value);
+ /**
+  * Frees a cmd_results object.
+  */
+@@ -123,8 +130,12 @@ sway_cmd cmd_client_background;
+ sway_cmd cmd_commands;
+ sway_cmd cmd_create_output;
+ sway_cmd cmd_default_border;
++sway_cmd cmd_default_dim_inactive;
+ sway_cmd cmd_default_floating_border;
+ sway_cmd cmd_default_orientation;
++sway_cmd cmd_dim_inactive;
++sway_cmd cmd_dim_inactive_colors_unfocused;
++sway_cmd cmd_dim_inactive_colors_urgent;
+ sway_cmd cmd_exec;
+ sway_cmd cmd_exec_always;
+ sway_cmd cmd_exit;
+@@ -176,6 +187,12 @@ sway_cmd cmd_set;
+ sway_cmd cmd_set_from_resource;
+ // Releases the trawl proxy that set_from_resource shares within a config load.
+ void set_from_resource_end_config_load(void);
++sway_cmd cmd_shadow_blur_radius;
++sway_cmd cmd_shadow_color;
++sway_cmd cmd_shadow_inactive_color;
++sway_cmd cmd_shadow_offset;
++sway_cmd cmd_shadows;
++sway_cmd cmd_shadows_on_csd;
+ sway_cmd cmd_shortcuts_inhibitor;
+ sway_cmd cmd_show_marks;
+ sway_cmd cmd_smart_borders;
+diff --git a/include/sway/config.h b/include/sway/config.h
+--- a/include/sway/config.h
++++ b/include/sway/config.h
+@@ -586,6 +586,22 @@ struct sway_config {
+ 
+ 	bool has_focused_tab_title;
+ 
++	// inactive window dimming
++	float default_dim_inactive;
++	struct {
++		float unfocused[4];
++		float urgent[4];
++	} dim_inactive_colors;
++
++	// window shadows
++	bool shadow_enabled;
++	bool shadows_on_csd_enabled;
++	int shadow_blur_radius;
++	float shadow_color[4];
++	float shadow_inactive_color[4];
++	int shadow_offset_x;
++	int shadow_offset_y;
++
+ 	// floating view
+ 	int32_t floating_maximum_width;
+ 	int32_t floating_maximum_height;
+diff --git a/include/sway/desktop/effects.h b/include/sway/desktop/effects.h
+new file mode 100644
+--- /dev/null
++++ b/include/sway/desktop/effects.h
+@@ -0,0 +1,47 @@
++#ifndef _SWAY_DESKTOP_EFFECTS_H
++#define _SWAY_DESKTOP_EFFECTS_H
++#include <stdbool.h>
++#include <wlr/types/wlr_scene.h>
++#include <wlr/util/box.h>
++
++struct sway_container;
++
++/**
++ * Allocate the scene nodes a view container uses to dim itself and to cast a
++ * drop shadow. The dim node is created inside the container's scene tree; the
++ * shadow tree starts out in the staging tree and is placed by the arrange code.
++ */
++bool container_effects_create(struct sway_container *con);
++
++/**
++ * Destroy the dim node and the shadow tree wherever they are currently placed.
++ */
++void container_effects_destroy(struct sway_container *con);
++
++/**
++ * Place the dim node on top of parent, covering box (relative to the origin of
++ * parent), then refresh it.
++ */
++void container_arrange_dim(struct sway_container *con,
++		struct wlr_scene_tree *parent, const struct wlr_box *box);
++
++/**
++ * Refresh the dim node's colour and visibility from the container's current
++ * focus and urgency state and the dimming configuration.
++ */
++void container_update_dim(struct sway_container *con);
++
++/**
++ * Place the container's shadow in layer, cast by box (relative to the origin
++ * of the container's scene tree). A NULL layer means that the container casts
++ * no shadow in its current position.
++ */
++void container_arrange_shadow(struct sway_container *con,
++		struct wlr_scene_tree *layer, const struct wlr_box *box);
++
++/**
++ * Hide the shadows of a container and all its descendants.
++ */
++void container_disable_shadows(struct sway_container *con);
++
++#endif
+diff --git a/include/sway/tree/container.h b/include/sway/tree/container.h
+--- a/include/sway/tree/container.h
++++ b/include/sway/tree/container.h
+@@ -93,6 +93,32 @@ struct sway_container {
+ 	struct wlr_scene_tree *content_tree;
+ 	struct wlr_scene_buffer *output_handler;
+ 
++	// Inactive dimming overlay; only view containers have one. It covers
++	// the view rectangle, borders included and title bar excluded.
++	struct wlr_scene_buffer *dim_node;
++	uint32_t dim_pixel; // premultiplied ARGB8888 colour of dim_node
++	int dim_width, dim_height;
++
++	// Shadows of the windows in this container while it floats, at the
++	// bottom of scene_tree, below the container's own decorations.
++	struct wlr_scene_tree *floating_shadows;
++
++	// Drop shadow; only view containers have one. The tree is placed in the
++	// workspace's shadow layer for tiled windows and in floating_shadows of
++	// the floating container for floating windows, and is parked in the
++	// staging tree while the window casts no shadow.
++	struct {
++		struct wlr_scene_tree *tree;
++		struct wlr_scene_buffer *pieces[9];
++
++		// What the shadow image was last rendered with
++		bool rendered;
++		int radius;
++		float scale;
++		float color[4];
++		int corner; // depth of the corners and edges, in buffer pixels
++	} shadow;
++
+ 	struct wl_listener output_enter;
+ 	struct wl_listener output_leave;
+ 	struct wl_listener output_handler_destroy;
+@@ -144,6 +170,10 @@ struct sway_container {
+ 
+ 	float alpha;
+ 
++	// This window's own darkening amount while unfocused, or a negative
++	// value to follow default_dim_inactive.
++	float dim_inactive;
++
+ 	list_t *marks; // char *
+ 
+ 	struct {
+@@ -278,6 +308,12 @@ struct sway_container *container_toplevel_ancestor(
+  */
+ bool container_is_floating_or_child(struct sway_container *container);
+ 
++/**
++ * Return true if, in its current (applied) state, the container is neither
++ * focused nor inside the focused container or workspace.
++ */
++bool container_is_current_unfocused(struct sway_container *container);
++
+ /**
+  * Return true if the container is fullscreen, or a child of a fullscreen split
+  * container.
+diff --git a/include/sway/tree/workspace.h b/include/sway/tree/workspace.h
+--- a/include/sway/tree/workspace.h
++++ b/include/sway/tree/workspace.h
+@@ -26,6 +26,7 @@ struct sway_workspace {
+ 	struct sway_node node;
+ 
+ 	struct {
++		struct wlr_scene_tree *shadows; // shadows of tiled windows
+ 		struct wlr_scene_tree *tiling;
+ 		struct wlr_scene_tree *fullscreen;
+ 	} layers;
+diff --git a/include/util.h b/include/util.h
+--- a/include/util.h
++++ b/include/util.h
+@@ -41,6 +41,12 @@ int wrap(int i, int max);
+  */
+ bool parse_color(const char *color, uint32_t *result);
+ 
++/**
++ * Like parse_color, but only accepts colors written as #RRGGBB or #RRGGBBAA,
++ * with the leading '#'.
++ */
++bool parse_hex_color(const char *color, uint32_t *result);
++
+ void color_to_rgba(float dest[static 4], uint32_t color);
+ 
+ /**
+@@ -57,6 +63,13 @@ bool parse_boolean(const char *boolean, bool current);
+  */
+ float parse_float(const char *value);
+ 
++/**
++ * Given a string that represents a whole decimal number, set result to its
++ * value. Returns false, leaving result untouched, if the string holds anything
++ * else or a value outside the range of int.
++ */
++bool parse_int(const char *value, int *result);
++
+ const char *sway_wl_output_subpixel_to_string(enum wl_output_subpixel subpixel);
+ 
+ bool sway_set_cloexec(int fd, bool cloexec);
+diff --git a/sway/commands.c b/sway/commands.c
+--- a/sway/commands.c
++++ b/sway/commands.c
+@@ -56,7 +56,10 @@ static const struct cmd_handler handlers[] = {
+ 	{ "client.unfocused", cmd_client_unfocused },
+ 	{ "client.urgent", cmd_client_urgent },
+ 	{ "default_border", cmd_default_border },
++	{ "default_dim_inactive", cmd_default_dim_inactive },
+ 	{ "default_floating_border", cmd_default_floating_border },
++	{ "dim_inactive_colors.unfocused", cmd_dim_inactive_colors_unfocused },
++	{ "dim_inactive_colors.urgent", cmd_dim_inactive_colors_urgent },
+ 	{ "exec", cmd_exec },
+ 	{ "exec_always", cmd_exec_always },
+ 	{ "floating_maximum_size", cmd_floating_maximum_size },
+@@ -84,6 +87,12 @@ static const struct cmd_handler handlers[] = {
+ 	{ "seat", cmd_seat },
+ 	{ "set", cmd_set },
+ 	{ "set_from_resource", cmd_set_from_resource },
++	{ "shadow_blur_radius", cmd_shadow_blur_radius },
++	{ "shadow_color", cmd_shadow_color },
++	{ "shadow_inactive_color", cmd_shadow_inactive_color },
++	{ "shadow_offset", cmd_shadow_offset },
++	{ "shadows", cmd_shadows },
++	{ "shadows_on_csd", cmd_shadows_on_csd },
+ 	{ "show_marks", cmd_show_marks },
+ 	{ "smart_borders", cmd_smart_borders },
+ 	{ "smart_gaps", cmd_smart_gaps },
+@@ -116,6 +125,7 @@ static const struct cmd_handler command_handlers[] = {
+ 	{ "allow_tearing", cmd_allow_tearing },
+ 	{ "border", cmd_border },
+ 	{ "create_output", cmd_create_output },
++	{ "dim_inactive", cmd_dim_inactive },
+ 	{ "exit", cmd_exit },
+ 	{ "floating", cmd_floating },
+ 	{ "fullscreen", cmd_fullscreen },
+diff --git a/sway/commands/dim_inactive.c b/sway/commands/dim_inactive.c
+new file mode 100644
+--- /dev/null
++++ b/sway/commands/dim_inactive.c
+@@ -0,0 +1,66 @@
++#include <math.h>
++#include "sway/commands.h"
++#include "sway/config.h"
++#include "sway/tree/arrange.h"
++#include "sway/tree/container.h"
++#include "sway/tree/node.h"
++#include "util.h"
++
++struct cmd_results *dim_inactive_parse(const char *name, int argc, char **argv,
++		float *value) {
++	struct cmd_results *error = NULL;
++	if ((error = checkarg(argc, name, EXPECTED_EQUAL_TO, 1))) {
++		return error;
++	}
++
++	float amount = argv[0][0] ? parse_float(argv[0]) : NAN;
++	// NAN fails both comparisons
++	if (!(amount >= 0.0f && amount <= 1.0f)) {
++		return cmd_results_new(CMD_INVALID,
++			"Invalid %s value '%s' (expected a number from 0 to 1)",
++			name, argv[0]);
++	}
++
++	*value = amount;
++	return NULL;
++}
++
++struct cmd_results *cmd_default_dim_inactive(int argc, char **argv) {
++	float amount;
++	struct cmd_results *error =
++		dim_inactive_parse("default_dim_inactive", argc, argv, &amount);
++	if (error) {
++		return error;
++	}
++
++	config->default_dim_inactive = amount;
++
++	if (config->active) {
++		arrange_root();
++	}
++
++	return cmd_results_new(CMD_SUCCESS, NULL);
++}
++
++struct cmd_results *cmd_dim_inactive(int argc, char **argv) {
++	float amount;
++	struct cmd_results *error =
++		dim_inactive_parse("dim_inactive", argc, argv, &amount);
++	if (error) {
++		return error;
++	}
++
++	struct sway_container *con = config->handler_context.container;
++	if (!con) {
++		return cmd_results_new(CMD_FAILURE, "No current container");
++	}
++	if (!con->view) {
++		return cmd_results_new(CMD_INVALID,
++			"dim_inactive can only be set for windows");
++	}
++
++	con->dim_inactive = amount;
++	node_set_dirty(&con->node);
++
++	return cmd_results_new(CMD_SUCCESS, NULL);
++}
+diff --git a/sway/commands/dim_inactive_colors.c b/sway/commands/dim_inactive_colors.c
+new file mode 100644
+--- /dev/null
++++ b/sway/commands/dim_inactive_colors.c
+@@ -0,0 +1,36 @@
++#include "sway/commands.h"
++#include "sway/config.h"
++#include "sway/tree/arrange.h"
++#include "util.h"
++
++static struct cmd_results *handle_command(int argc, char **argv,
++		const char *name, float rgba[static 4]) {
++	struct cmd_results *error = NULL;
++	if ((error = checkarg(argc, name, EXPECTED_EQUAL_TO, 1))) {
++		return error;
++	}
++
++	uint32_t color;
++	if (!parse_hex_color(argv[0], &color)) {
++		return cmd_results_new(CMD_INVALID,
++			"Invalid %s color '%s' (expected #RRGGBB or #RRGGBBAA)",
++			name, argv[0]);
++	}
++	color_to_rgba(rgba, color);
++
++	if (config->active) {
++		arrange_root();
++	}
++
++	return cmd_results_new(CMD_SUCCESS, NULL);
++}
++
++struct cmd_results *cmd_dim_inactive_colors_unfocused(int argc, char **argv) {
++	return handle_command(argc, argv, "dim_inactive_colors.unfocused",
++		config->dim_inactive_colors.unfocused);
++}
++
++struct cmd_results *cmd_dim_inactive_colors_urgent(int argc, char **argv) {
++	return handle_command(argc, argv, "dim_inactive_colors.urgent",
++		config->dim_inactive_colors.urgent);
++}
+diff --git a/sway/commands/for_window.c b/sway/commands/for_window.c
+--- a/sway/commands/for_window.c
++++ b/sway/commands/for_window.c
+@@ -1,10 +1,72 @@
++#include <ctype.h>
++#include <stdlib.h>
+ #include <string.h>
++#include <strings.h>
+ #include "sway/commands.h"
+ #include "sway/criteria.h"
+ #include "list.h"
+ #include "log.h"
+ #include "stringop.h"
+ 
++/**
++ * The commands of a rule only run once a matching window appears. Settings
++ * whose arguments can be checked without a window are checked here already,
++ * so that a rule which could never apply makes the configuration fail.
++ */
++static struct cmd_results *check_cmdlist(const char *cmdlist) {
++	char *copy = strdup(cmdlist);
++	if (!copy) {
++		return NULL;
++	}
++
++	struct cmd_results *error = NULL;
++	char *head = copy;
++	char matched_delim = ';';
++	do {
++		for (; isspace(*head); ++head) {}
++		if (matched_delim == ';' && *head == '[') {
++			char *criteria_error = NULL;
++			struct criteria *criteria = criteria_parse(head, &criteria_error);
++			if (!criteria) {
++				// reported when the rule runs, as before
++				free(criteria_error);
++				break;
++			}
++			head += strlen(criteria->raw);
++			criteria_destroy(criteria);
++		}
++
++		char *cmd = argsep(&head, ";,", &matched_delim);
++		for (; isspace(*cmd); ++cmd) {}
++		if (*cmd == '\0') {
++			continue;
++		}
++
++		int cmd_argc;
++		char **cmd_argv = split_args(cmd, &cmd_argc);
++		if (cmd_argc > 0 && strcasecmp(cmd_argv[0], "dim_inactive") == 0) {
++			// A variable still in the rule may be set later in the
++			// configuration; it is expanded when the rule runs.
++			bool has_variable = false;
++			for (int i = 1; i < cmd_argc; ++i) {
++				if (*cmd_argv[i] == '\"' || *cmd_argv[i] == '\'') {
++					strip_quotes(cmd_argv[i]);
++				}
++				has_variable = has_variable || strchr(cmd_argv[i], '$');
++			}
++			float amount;
++			if (!has_variable) {
++				error = dim_inactive_parse("dim_inactive",
++					cmd_argc - 1, cmd_argv + 1, &amount);
++			}
++		}
++		free_argv(cmd_argc, cmd_argv);
++	} while (head && !error);
++
++	free(copy);
++	return error;
++}
++
+ struct cmd_results *cmd_for_window(int argc, char **argv) {
+ 	struct cmd_results *error = NULL;
+ 	if ((error = checkarg(argc, "for_window", EXPECTED_AT_LEAST, 2))) {
+@@ -22,6 +84,11 @@ struct cmd_results *cmd_for_window(int argc, char **argv) {
+ 	criteria->type = CT_COMMAND;
+ 	criteria->cmdlist = join_args(argv + 1, argc - 1);
+ 
++	if ((error = check_cmdlist(criteria->cmdlist))) {
++		criteria_destroy(criteria);
++		return error;
++	}
++
+ 	// Check if it already exists
+ 	if (criteria_already_exists(criteria)) {
+ 		sway_log(SWAY_DEBUG, "for_window already exists: '%s' -> '%s'",
+diff --git a/sway/commands/reload.c b/sway/commands/reload.c
+--- a/sway/commands/reload.c
++++ b/sway/commands/reload.c
+@@ -1,6 +1,7 @@
+ #include <string.h>
+ #include "sway/commands.h"
+ #include "sway/config.h"
++#include "sway/desktop/transaction.h"
+ #include "sway/ipc-server.h"
+ #include "sway/server.h"
+ #include "sway/tree/arrange.h"
+@@ -49,6 +50,7 @@ static void do_reload(void *data) {
+ 	root_for_each_container(title_bar_update_iterator, NULL);
+ 
+ 	arrange_root();
++	transaction_commit_dirty();
+ }
+ 
+ struct cmd_results *cmd_reload(int argc, char **argv) {
+diff --git a/sway/commands/shadow_blur_radius.c b/sway/commands/shadow_blur_radius.c
+new file mode 100644
+--- /dev/null
++++ b/sway/commands/shadow_blur_radius.c
+@@ -0,0 +1,26 @@
++#include "sway/commands.h"
++#include "sway/config.h"
++#include "sway/tree/arrange.h"
++#include "util.h"
++
++struct cmd_results *cmd_shadow_blur_radius(int argc, char **argv) {
++	struct cmd_results *error = NULL;
++	if ((error = checkarg(argc, "shadow_blur_radius", EXPECTED_EQUAL_TO, 1))) {
++		return error;
++	}
++
++	int radius;
++	if (!parse_int(argv[0], &radius) || radius < 0 || radius > 99) {
++		return cmd_results_new(CMD_INVALID,
++			"Invalid shadow_blur_radius '%s' (expected a whole number "
++			"from 0 to 99)", argv[0]);
++	}
++
++	config->shadow_blur_radius = radius;
++
++	if (config->active) {
++		arrange_root();
++	}
++
++	return cmd_results_new(CMD_SUCCESS, NULL);
++}
+diff --git a/sway/commands/shadow_color.c b/sway/commands/shadow_color.c
+new file mode 100644
+--- /dev/null
++++ b/sway/commands/shadow_color.c
+@@ -0,0 +1,34 @@
++#include "sway/commands.h"
++#include "sway/config.h"
++#include "sway/tree/arrange.h"
++#include "util.h"
++
++static struct cmd_results *handle_command(int argc, char **argv,
++		const char *name, float rgba[static 4]) {
++	struct cmd_results *error = NULL;
++	if ((error = checkarg(argc, name, EXPECTED_EQUAL_TO, 1))) {
++		return error;
++	}
++
++	uint32_t color;
++	if (!parse_hex_color(argv[0], &color)) {
++		return cmd_results_new(CMD_INVALID,
++			"Invalid %s '%s' (expected #RRGGBB or #RRGGBBAA)", name, argv[0]);
++	}
++	color_to_rgba(rgba, color);
++
++	if (config->active) {
++		arrange_root();
++	}
++
++	return cmd_results_new(CMD_SUCCESS, NULL);
++}
++
++struct cmd_results *cmd_shadow_color(int argc, char **argv) {
++	return handle_command(argc, argv, "shadow_color", config->shadow_color);
++}
++
++struct cmd_results *cmd_shadow_inactive_color(int argc, char **argv) {
++	return handle_command(argc, argv, "shadow_inactive_color",
++		config->shadow_inactive_color);
++}
+diff --git a/sway/commands/shadow_offset.c b/sway/commands/shadow_offset.c
+new file mode 100644
+--- /dev/null
++++ b/sway/commands/shadow_offset.c
+@@ -0,0 +1,27 @@
++#include "sway/commands.h"
++#include "sway/config.h"
++#include "sway/tree/arrange.h"
++#include "util.h"
++
++struct cmd_results *cmd_shadow_offset(int argc, char **argv) {
++	struct cmd_results *error = NULL;
++	if ((error = checkarg(argc, "shadow_offset", EXPECTED_EQUAL_TO, 2))) {
++		return error;
++	}
++
++	int x, y;
++	if (!parse_int(argv[0], &x) || !parse_int(argv[1], &y)) {
++		return cmd_results_new(CMD_INVALID,
++			"Invalid shadow_offset '%s %s' (expected two whole numbers)",
++			argv[0], argv[1]);
++	}
++
++	config->shadow_offset_x = x;
++	config->shadow_offset_y = y;
++
++	if (config->active) {
++		arrange_root();
++	}
++
++	return cmd_results_new(CMD_SUCCESS, NULL);
++}
+diff --git a/sway/commands/shadows.c b/sway/commands/shadows.c
+new file mode 100644
+--- /dev/null
++++ b/sway/commands/shadows.c
+@@ -0,0 +1,36 @@
++#include <strings.h>
++#include "sway/commands.h"
++#include "sway/config.h"
++#include "sway/tree/arrange.h"
++
++static struct cmd_results *handle_command(int argc, char **argv,
++		const char *name, bool *value) {
++	struct cmd_results *error = NULL;
++	if ((error = checkarg(argc, name, EXPECTED_EQUAL_TO, 1))) {
++		return error;
++	}
++
++	if (strcasecmp(argv[0], "enable") == 0) {
++		*value = true;
++	} else if (strcasecmp(argv[0], "disable") == 0) {
++		*value = false;
++	} else {
++		return cmd_results_new(CMD_INVALID,
++			"Expected '%s enable|disable'", name);
++	}
++
++	if (config->active) {
++		arrange_root();
++	}
++
++	return cmd_results_new(CMD_SUCCESS, NULL);
++}
++
++struct cmd_results *cmd_shadows(int argc, char **argv) {
++	return handle_command(argc, argv, "shadows", &config->shadow_enabled);
++}
++
++struct cmd_results *cmd_shadows_on_csd(int argc, char **argv) {
++	return handle_command(argc, argv, "shadows_on_csd",
++		&config->shadows_on_csd_enabled);
++}
+diff --git a/sway/config.c b/sway/config.c
+--- a/sway/config.c
++++ b/sway/config.c
+@@ -343,6 +343,20 @@ static void config_defaults(struct sway_config *config) {
+ 
+ 	color_to_rgba(config->border_colors.background, 0xFFFFFFFF);
+ 
++	// inactive window dimming
++	config->default_dim_inactive = 0.0f;
++	color_to_rgba(config->dim_inactive_colors.unfocused, 0x000000FF);
++	color_to_rgba(config->dim_inactive_colors.urgent, 0x900000FF);
++
++	// window shadows
++	config->shadow_enabled = false;
++	config->shadows_on_csd_enabled = false;
++	config->shadow_blur_radius = 20;
++	color_to_rgba(config->shadow_color, 0x0000007F);
++	color_to_rgba(config->shadow_inactive_color, 0x0000007F);
++	config->shadow_offset_x = 0;
++	config->shadow_offset_y = 0;
++
+ 	// The keysym to keycode translation
+ 	struct xkb_rule_names rules = {0};
+ 	config->keysym_translation_state = keysym_translation_state_create(rules, 0);
+diff --git a/sway/desktop/effects.c b/sway/desktop/effects.c
+new file mode 100644
+--- /dev/null
++++ b/sway/desktop/effects.c
+@@ -0,0 +1,496 @@
++#include <drm_fourcc.h>
++#include <math.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++#include <wlr/interfaces/wlr_buffer.h>
++#include <wlr/types/wlr_buffer.h>
++#include <wlr/types/wlr_output.h>
++#include <wlr/types/wlr_scene.h>
++#include <wlr/util/box.h>
++#include "sway/config.h"
++#include "sway/desktop/effects.h"
++#include "sway/output.h"
++#include "sway/tree/container.h"
++#include "sway/tree/root.h"
++#include "sway/tree/view.h"
++#include "sway/tree/workspace.h"
++#include "log.h"
++
++/*
++ * Dimming and shadows are made of scene buffers holding small, CPU-rendered
++ * premultiplied ARGB8888 images, so they look the same with every renderer,
++ * including the software one. They never take pointer input: clicks and
++ * motion go through to whatever lies underneath.
++ */
++
++struct pixel_buffer {
++	struct wlr_buffer base;
++	uint32_t *data;
++	size_t stride;
++};
++
++static void pixel_buffer_handle_destroy(struct wlr_buffer *wlr_buffer) {
++	struct pixel_buffer *buffer = wl_container_of(wlr_buffer, buffer, base);
++	free(buffer->data);
++	free(buffer);
++}
++
++static bool pixel_buffer_handle_begin_data_ptr_access(struct wlr_buffer *wlr_buffer,
++		uint32_t flags, void **data, uint32_t *format, size_t *stride) {
++	struct pixel_buffer *buffer = wl_container_of(wlr_buffer, buffer, base);
++	*data = buffer->data;
++	*format = DRM_FORMAT_ARGB8888;
++	*stride = buffer->stride;
++	return true;
++}
++
++static void pixel_buffer_handle_end_data_ptr_access(struct wlr_buffer *wlr_buffer) {
++	// This space is intentionally left blank
++}
++
++static const struct wlr_buffer_impl pixel_buffer_impl = {
++	.destroy = pixel_buffer_handle_destroy,
++	.begin_data_ptr_access = pixel_buffer_handle_begin_data_ptr_access,
++	.end_data_ptr_access = pixel_buffer_handle_end_data_ptr_access,
++};
++
++static struct pixel_buffer *pixel_buffer_create(int width, int height) {
++	struct pixel_buffer *buffer = calloc(1, sizeof(*buffer));
++	if (!buffer) {
++		return NULL;
++	}
++	buffer->data = calloc((size_t)width * height, sizeof(uint32_t));
++	if (!buffer->data) {
++		free(buffer);
++		return NULL;
++	}
++	buffer->stride = (size_t)width * sizeof(uint32_t);
++	wlr_buffer_init(&buffer->base, &pixel_buffer_impl, width, height);
++	return buffer;
++}
++
++static uint8_t to_byte(float value) {
++	value = value < 0.0f ? 0.0f : value > 1.0f ? 1.0f : value;
++	return (uint8_t)lroundf(value * 255.0f);
++}
++
++// color is straight RGB; alpha is the coverage the pixel gets
++static uint32_t premultiplied_pixel(const float color[static 3], float alpha) {
++	uint8_t a = to_byte(alpha);
++	uint8_t r = to_byte(color[0] * alpha);
++	uint8_t g = to_byte(color[1] * alpha);
++	uint8_t b = to_byte(color[2] * alpha);
++	return (uint32_t)a << 24 | (uint32_t)r << 16 | (uint32_t)g << 8 | b;
++}
++
++static bool effect_point_accepts_input(struct wlr_scene_buffer *buffer,
++		double *x, double *y) {
++	return false;
++}
++
++static struct wlr_scene_buffer *effect_buffer_create(struct wlr_scene_tree *parent) {
++	struct wlr_scene_buffer *buffer = wlr_scene_buffer_create(parent, NULL);
++	if (buffer) {
++		buffer->point_accepts_input = effect_point_accepts_input;
++	}
++	return buffer;
++}
++
++bool container_effects_create(struct sway_container *con) {
++	con->dim_node = effect_buffer_create(con->scene_tree);
++	if (!con->dim_node) {
++		return false;
++	}
++	wlr_scene_node_set_enabled(&con->dim_node->node, false);
++
++	con->shadow.tree = wlr_scene_tree_create(root->staging);
++	if (!con->shadow.tree) {
++		return false;
++	}
++	wlr_scene_node_set_enabled(&con->shadow.tree->node, false);
++	for (size_t i = 0; i < sizeof(con->shadow.pieces) / sizeof(con->shadow.pieces[0]); i++) {
++		con->shadow.pieces[i] = effect_buffer_create(con->shadow.tree);
++		if (!con->shadow.pieces[i]) {
++			return false;
++		}
++	}
++	return true;
++}
++
++void container_effects_destroy(struct sway_container *con) {
++	if (con->dim_node) {
++		wlr_scene_node_destroy(&con->dim_node->node);
++		con->dim_node = NULL;
++	}
++	if (con->shadow.tree) {
++		wlr_scene_node_destroy(&con->shadow.tree->node);
++		con->shadow.tree = NULL;
++	}
++}
++
++/* Dimming */
++
++void container_update_dim(struct sway_container *con) {
++	if (!con->dim_node) {
++		return;
++	}
++
++	float amount = con->dim_inactive >= 0.0f ?
++		con->dim_inactive : config->default_dim_inactive;
++	const float *color = view_is_urgent(con->view) ?
++		config->dim_inactive_colors.urgent : config->dim_inactive_colors.unfocused;
++	float alpha = amount * color[3];
++
++	if (alpha <= 0.0f || con->dim_width <= 0 || con->dim_height <= 0 ||
++			!container_is_current_unfocused(con)) {
++		wlr_scene_node_set_enabled(&con->dim_node->node, false);
++		return;
++	}
++
++	uint32_t pixel = premultiplied_pixel(color, alpha);
++	if (!con->dim_node->buffer || pixel != con->dim_pixel) {
++		// A 3x3 image sampled at its centre pixel and stretched over the
++		// box: every filter only ever reads identical neighbours, so the
++		// colour stays uniform up to the edges.
++		struct pixel_buffer *buffer = pixel_buffer_create(3, 3);
++		if (!buffer) {
++			sway_log(SWAY_ERROR, "Failed to allocate the dim buffer");
++			wlr_scene_node_set_enabled(&con->dim_node->node, false);
++			return;
++		}
++		for (int i = 0; i < 9; i++) {
++			buffer->data[i] = pixel;
++		}
++		wlr_scene_buffer_set_buffer(con->dim_node, &buffer->base);
++		wlr_buffer_drop(&buffer->base);
++		wlr_scene_buffer_set_source_box(con->dim_node,
++			&(struct wlr_fbox){ .x = 1, .y = 1, .width = 1, .height = 1 });
++		con->dim_pixel = pixel;
++	}
++	wlr_scene_node_set_enabled(&con->dim_node->node, true);
++}
++
++void container_arrange_dim(struct sway_container *con,
++		struct wlr_scene_tree *parent, const struct wlr_box *box) {
++	if (!con->dim_node) {
++		return;
++	}
++
++	wlr_scene_node_reparent(&con->dim_node->node, parent);
++	wlr_scene_node_raise_to_top(&con->dim_node->node);
++	wlr_scene_node_set_position(&con->dim_node->node, box->x, box->y);
++	con->dim_width = box->width;
++	con->dim_height = box->height;
++	if (box->width > 0 && box->height > 0) {
++		wlr_scene_buffer_set_dest_size(con->dim_node, box->width, box->height);
++	}
++	container_update_dim(con);
++}
++
++/* Shadows */
++
++enum shadow_segment {
++	SHADOW_BEFORE,
++	SHADOW_ALONG,
++	SHADOW_AFTER,
++};
++
++// Distance in logical pixels from the centre of template pixel i to the
++// template's middle section, along one axis.
++static double shadow_template_distance(int i, int corner, int center, float scale) {
++	if (i < corner) {
++		return (corner - i - 0.5) / scale;
++	} else if (i < corner + center) {
++		return 0.0;
++	}
++	return (i - corner - center + 0.5) / scale;
++}
++
++static float shadow_coverage(double distance, int radius, float alpha) {
++	if (radius == 0) {
++		return distance == 0.0 ? alpha : 0.0f;
++	}
++	if (distance >= radius) {
++		return 0.0f;
++	}
++	double falloff = 1.0 - distance / radius;
++	return alpha * falloff * falloff;
++}
++
++static const enum shadow_segment shadow_segments[] = {
++	SHADOW_BEFORE, SHADOW_ALONG, SHADOW_AFTER,
++};
++
++/**
++ * The shadow of a box is cut from one template image: four corners and four
++ * edges at their natural size around a uniform middle. The edge and middle
++ * pieces stretch a single pixel taken from the middle of the template, so
++ * the images stay small whatever the size of the window.
++ *
++ * Each of the nine pieces has an image of its own holding only its part of
++ * the template: wlroots keeps one texture per scene buffer, so nine pieces
++ * sharing the whole template would cost a GPU renderer nine copies of it.
++ * A part keeps a one-pixel apron of the template pixels next to it on the
++ * sides that face the middle. Filtering a stretched or scaled piece reads
++ * those neighbours, so the piece samples exactly what it would from the
++ * whole template, whether the renderer clamps at the edge of an image or
++ * reads transparency beyond it.
++ *
++ * shadow_segment_crop() gives the part of the template, along one axis, that
++ * the image of a piece in that segment holds.
++ */
++static void shadow_segment_crop(enum shadow_segment segment, int corner,
++		int center, int *start, int *length) {
++	switch (segment) {
++	case SHADOW_BEFORE:
++		*start = 0;
++		*length = corner + 1;
++		break;
++	case SHADOW_ALONG:
++		*start = corner + center / 2 - 1;
++		*length = 3;
++		break;
++	case SHADOW_AFTER:
++	default:
++		*start = corner + center - 1;
++		*length = corner + 1;
++		break;
++	}
++}
++
++static bool shadow_render(struct sway_container *con, int radius,
++		float scale, const float color[static 4]) {
++	int corner = (int)lround(radius * scale);
++	int center = (int)ceilf(3.0f * scale);
++	if (center < 3) {
++		center = 3;
++	}
++	int size = 2 * corner + center;
++
++	double *distance = calloc(size, sizeof(double));
++	if (!distance) {
++		sway_log(SWAY_ERROR, "Failed to allocate the shadow buffers");
++		return false;
++	}
++	for (int i = 0; i < size; i++) {
++		distance[i] = shadow_template_distance(i, corner, center, scale);
++	}
++
++	struct pixel_buffer *buffers[9] = {0};
++	bool allocated = true;
++	for (int row = 0; row < 3 && allocated; row++) {
++		int y0, height;
++		shadow_segment_crop(shadow_segments[row], corner, center, &y0, &height);
++		for (int col = 0; col < 3; col++) {
++			int x0, width;
++			shadow_segment_crop(shadow_segments[col], corner, center, &x0, &width);
++			struct pixel_buffer *buffer = pixel_buffer_create(width, height);
++			if (!buffer) {
++				allocated = false;
++				break;
++			}
++			buffers[row * 3 + col] = buffer;
++			for (int y = 0; y < height; y++) {
++				uint32_t *pixels = buffer->data + (size_t)y * width;
++				double dy = distance[y0 + y];
++				for (int x = 0; x < width; x++) {
++					double dx = distance[x0 + x];
++					double d = dx == 0.0 ? dy : dy == 0.0 ? dx : hypot(dx, dy);
++					float coverage = shadow_coverage(d, radius, color[3]);
++					pixels[x] = coverage > 0.0f ? premultiplied_pixel(color, coverage) : 0;
++				}
++			}
++		}
++	}
++	free(distance);
++
++	for (size_t i = 0; i < sizeof(buffers) / sizeof(buffers[0]); i++) {
++		if (!buffers[i]) {
++			continue;
++		}
++		if (allocated) {
++			wlr_scene_buffer_set_buffer(con->shadow.pieces[i], &buffers[i]->base);
++		}
++		wlr_buffer_drop(&buffers[i]->base);
++	}
++	if (!allocated) {
++		sway_log(SWAY_ERROR, "Failed to allocate the shadow buffers");
++		return false;
++	}
++
++	con->shadow.radius = radius;
++	con->shadow.scale = scale;
++	memcpy(con->shadow.color, color, sizeof(con->shadow.color));
++	con->shadow.corner = corner;
++	con->shadow.rendered = true;
++	return true;
++}
++
++/**
++ * One axis of a piece: the logical interval it covers, clipped to [clip_start,
++ * clip_end), and the interval of the piece's image it is taken from (see
++ * shadow_segment_crop()). Returns false when nothing of the piece is left on
++ * this axis.
++ */
++static bool shadow_piece_axis(enum shadow_segment segment, int start, int length,
++		int radius, int corner, int clip_start, int clip_end,
++		int *dst_start, int *dst_length, double *src_start, double *src_length) {
++	int seg_start, seg_length;
++	switch (segment) {
++	case SHADOW_BEFORE:
++		seg_start = start - radius;
++		seg_length = radius;
++		*src_start = 0;
++		*src_length = corner;
++		break;
++	case SHADOW_ALONG:
++		// The middle pixel of three
++		seg_start = start;
++		seg_length = length;
++		*src_start = 1;
++		*src_length = 1;
++		break;
++	case SHADOW_AFTER:
++	default:
++		// After the apron
++		seg_start = start + length;
++		seg_length = radius;
++		*src_start = 1;
++		*src_length = corner;
++		break;
++	}
++
++	int clipped_start = seg_start > clip_start ? seg_start : clip_start;
++	int seg_end = seg_start + seg_length;
++	int clipped_end = seg_end < clip_end ? seg_end : clip_end;
++	if (seg_length <= 0 || clipped_end <= clipped_start) {
++		return false;
++	}
++
++	if (segment != SHADOW_ALONG) {
++		// Corner and edge depths map one to one onto their images; the
++		// stretched middle is uniform, so it needs no adjustment.
++		double ratio = *src_length / seg_length;
++		*src_start += (clipped_start - seg_start) * ratio;
++		*src_length = (clipped_end - clipped_start) * ratio;
++	}
++	*dst_start = clipped_start;
++	*dst_length = clipped_end - clipped_start;
++	return true;
++}
++
++// Park the shadow in the staging tree, so that it never goes away with the
++// tree it was last placed in.
++static void shadow_disable(struct sway_container *con) {
++	wlr_scene_node_set_enabled(&con->shadow.tree->node, false);
++	wlr_scene_node_reparent(&con->shadow.tree->node, root->staging);
++}
++
++void container_disable_shadows(struct sway_container *con) {
++	if (con->shadow.tree) {
++		shadow_disable(con);
++	}
++	if (!con->view && con->current.children) {
++		for (int i = 0; i < con->current.children->length; i++) {
++			container_disable_shadows(con->current.children->items[i]);
++		}
++	}
++}
++
++/**
++ * Whether the window has agreed through xdg-decoration to draw its own
++ * decorations. Sway sends the client-side mode exactly when it gives such a
++ * window the csd border, so the border settles the agreement. Windows that
++ * negotiate nothing are only assumed to decorate themselves (sway refuses
++ * "border csd" for them), and are treated like any other window.
++ */
++static bool container_draws_own_decorations(struct sway_container *con) {
++	return con->current.border == B_CSD && con->view->xdg_decoration;
++}
++
++void container_arrange_shadow(struct sway_container *con,
++		struct wlr_scene_tree *layer, const struct wlr_box *box) {
++	if (!con->shadow.tree) {
++		return;
++	}
++
++	struct sway_workspace *ws = con->current.workspace;
++	struct sway_output *output = ws ? ws->output : NULL;
++	const float *color = container_is_current_unfocused(con) ?
++		config->shadow_inactive_color : config->shadow_color;
++	int width = box->width, height = box->height;
++
++	if (!layer || !output || !output->wlr_output->enabled ||
++			!config->shadow_enabled || color[3] <= 0.0f ||
++			width <= 0 || height <= 0 ||
++			(!config->shadows_on_csd_enabled &&
++				container_draws_own_decorations(con))) {
++		shadow_disable(con);
++		return;
++	}
++
++	int radius = config->shadow_blur_radius;
++	float scale = output->wlr_output->scale;
++	if (!con->shadow.rendered || con->shadow.radius != radius ||
++			con->shadow.scale != scale ||
++			memcmp(con->shadow.color, color, sizeof(con->shadow.color)) != 0) {
++		if (!shadow_render(con, radius, scale, color)) {
++			shadow_disable(con);
++			return;
++		}
++	}
++
++	// The shadow tree's origin is the layout origin, so the pieces are
++	// positioned in layout coordinates.
++	wlr_scene_node_reparent(&con->shadow.tree->node, layer);
++	int layer_x, layer_y;
++	wlr_scene_node_coords(&layer->node, &layer_x, &layer_y);
++	wlr_scene_node_set_position(&con->shadow.tree->node, -layer_x, -layer_y);
++
++	int box_x, box_y;
++	wlr_scene_node_coords(&con->scene_tree->node, &box_x, &box_y);
++	box_x += box->x;
++	box_y += box->y;
++	// Offsets this large move any shadow off every output anyway; clamping
++	// keeps the layout arithmetic within range.
++	const int max_offset = 1 << 20;
++	int offset_x = config->shadow_offset_x < -max_offset ? -max_offset :
++		config->shadow_offset_x > max_offset ? max_offset : config->shadow_offset_x;
++	int offset_y = config->shadow_offset_y < -max_offset ? -max_offset :
++		config->shadow_offset_y > max_offset ? max_offset : config->shadow_offset_y;
++	int shadow_x = box_x + offset_x;
++	int shadow_y = box_y + offset_y;
++
++	// A shadow belongs to the output its window's workspace is on
++	struct wlr_box clip = {
++		.x = output->lx,
++		.y = output->ly,
++		.width = output->width,
++		.height = output->height,
++	};
++
++	for (int row = 0; row < 3; row++) {
++		for (int col = 0; col < 3; col++) {
++			struct wlr_scene_buffer *piece = con->shadow.pieces[row * 3 + col];
++			int dst_x, dst_y, dst_width, dst_height;
++			struct wlr_fbox src;
++			bool visible =
++				shadow_piece_axis(shadow_segments[col], shadow_x, width, radius,
++					con->shadow.corner, clip.x, clip.x + clip.width,
++					&dst_x, &dst_width, &src.x, &src.width) &&
++				shadow_piece_axis(shadow_segments[row], shadow_y, height, radius,
++					con->shadow.corner, clip.y, clip.y + clip.height,
++					&dst_y, &dst_height, &src.y, &src.height);
++			wlr_scene_node_set_enabled(&piece->node, visible);
++			if (!visible) {
++				continue;
++			}
++			wlr_scene_buffer_set_source_box(piece, &src);
++			wlr_scene_buffer_set_dest_size(piece, dst_width, dst_height);
++			wlr_scene_node_set_position(&piece->node, dst_x, dst_y);
++		}
++	}
++
++	wlr_scene_node_set_enabled(&con->shadow.tree->node, true);
++}
+diff --git a/sway/desktop/transaction.c b/sway/desktop/transaction.c
+--- a/sway/desktop/transaction.c
++++ b/sway/desktop/transaction.c
+@@ -5,6 +5,7 @@
+ #include <wlr/types/wlr_buffer.h>
+ #include "sway/config.h"
+ #include "sway/scene_descriptor.h"
++#include "sway/desktop/effects.h"
+ #include "sway/desktop/idle_inhibit_v1.h"
+ #include "sway/desktop/transaction.h"
+ #include "sway/input/cursor.h"
+@@ -272,6 +273,7 @@ static void arrange_title_bar(struct sway_container *con,
+ static void disable_container(struct sway_container *con) {
+ 	if (con->view) {
+ 		wlr_scene_node_reparent(&con->view->scene_tree->node, con->content_tree);
++		container_disable_shadows(con);
+ 	} else {
+ 		for (int i = 0; i < con->current.children->length; i++) {
+ 			struct sway_container *child = con->current.children->items[i];
+@@ -284,11 +286,12 @@ static void disable_container(struct sway_container *con) {
+ }
+ 
+ static void arrange_container(struct sway_container *con,
+-		int width, int height, bool title_bar, int gaps);
++		int width, int height, bool title_bar, int gaps,
++		struct wlr_scene_tree *shadows);
+ 
+ static void arrange_children(enum sway_container_layout layout, list_t *children,
+ 		struct sway_container *active, struct wlr_scene_tree *content,
+-		int width, int height, int gaps) {
++		int width, int height, int gaps, struct wlr_scene_tree *shadows) {
+ 	int title_bar_height = container_titlebar_height();
+ 
+ 	if (layout == L_TABBED) {
+@@ -315,7 +318,8 @@ static void arrange_children(enum sway_container_layout layout, list_t *children
+ 
+ 			int net_height = height - title_bar_height;
+ 			if (activated && width > 0 && net_height > 0) {
+-				arrange_container(child, width, net_height, title_bar_height == 0, 0);
++				arrange_container(child, width, net_height, title_bar_height == 0, 0,
++					shadows);
+ 			} else {
+ 				disable_container(child);
+ 			}
+@@ -345,7 +349,8 @@ static void arrange_children(enum sway_container_layout layout, list_t *children
+ 
+ 			int net_height = height - title_height;
+ 			if (activated && width > 0 && net_height > 0) {
+-				arrange_container(child, width, net_height, title_bar_height == 0, 0);
++				arrange_container(child, width, net_height, title_bar_height == 0, 0,
++					shadows);
+ 			} else {
+ 				disable_container(child);
+ 			}
+@@ -362,7 +367,7 @@ static void arrange_children(enum sway_container_layout layout, list_t *children
+ 			wlr_scene_node_set_position(&child->scene_tree->node, 0, off);
+ 			wlr_scene_node_reparent(&child->scene_tree->node, content);
+ 			if (width > 0 && cheight > 0) {
+-				arrange_container(child, width, cheight, true, gaps);
++				arrange_container(child, width, cheight, true, gaps, shadows);
+ 				off += cheight + gaps;
+ 			} else {
+ 				disable_container(child);
+@@ -378,7 +383,7 @@ static void arrange_children(enum sway_container_layout layout, list_t *children
+ 			wlr_scene_node_set_position(&child->scene_tree->node, off, 0);
+ 			wlr_scene_node_reparent(&child->scene_tree->node, content);
+ 			if (cwidth > 0 && height > 0) {
+-				arrange_container(child, cwidth, height, true, gaps);
++				arrange_container(child, cwidth, height, true, gaps, shadows);
+ 				off += cwidth + gaps;
+ 			} else {
+ 				disable_container(child);
+@@ -389,8 +394,13 @@ static void arrange_children(enum sway_container_layout layout, list_t *children
+ 	}
+ }
+ 
++/**
++ * Arrange a container in a width x height box. Views in it cast their shadows
++ * into the shadows tree, or cast none when it is NULL.
++ */
+ static void arrange_container(struct sway_container *con,
+-		int width, int height, bool title_bar, int gaps) {
++		int width, int height, bool title_bar, int gaps,
++		struct wlr_scene_tree *shadows) {
+ 	// this container might have previously been in the scratchpad,
+ 	// make sure it's enabled for viewing
+ 	wlr_scene_node_set_enabled(&con->scene_tree->node, true);
+@@ -456,6 +466,19 @@ static void arrange_container(struct sway_container *con,
+ 		wlr_scene_node_reparent(&con->view->scene_tree->node, con->content_tree);
+ 		wlr_scene_node_set_position(&con->view->scene_tree->node,
+ 			border_left, border_top);
++
++		// The window's box as the tree describes it: borders included, and
++		// below a title bar that the container draws itself.
++		int title_height = con->current.border == B_NORMAL && title_bar ?
++			border_top : 0;
++		struct wlr_box box = {
++			.x = 0,
++			.y = title_height,
++			.width = width,
++			.height = height - title_height,
++		};
++		container_arrange_dim(con, con->scene_tree, &box);
++		container_arrange_shadow(con, shadows, &box);
+ 	} else {
+ 		// make sure to disable the title bar if the parent is not managing it
+ 		if (title_bar) {
+@@ -464,7 +487,7 @@ static void arrange_container(struct sway_container *con,
+ 
+ 		arrange_children(con->current.layout, con->current.children,
+ 			con->current.focused_inactive_child, con->content_tree,
+-			width, height, gaps);
++			width, height, gaps, shadows);
+ 	}
+ }
+ 
+@@ -495,9 +518,16 @@ static void arrange_fullscreen(struct wlr_scene_tree *tree,
+ 
+ 		// if we only care about the view, disable any decorations
+ 		wlr_scene_node_set_enabled(&fs->scene_tree->node, false);
++
++		// the container's tree is hidden, so dim the view's tree instead
++		container_arrange_dim(fs, fs->view->scene_tree,
++			&(struct wlr_box){ .width = width, .height = height });
++		container_disable_shadows(fs);
+ 	} else {
+ 		fs_node = &fs->scene_tree->node;
+-		arrange_container(fs, width, height, true, container_get_gaps(fs));
++		// fullscreen windows cast no shadow
++		container_disable_shadows(fs);
++		arrange_container(fs, width, height, true, container_get_gaps(fs), NULL);
+ 	}
+ 
+ 	wlr_scene_node_reparent(fs_node, tree);
+@@ -537,7 +567,7 @@ static void arrange_workspace_floating(struct sway_workspace *ws) {
+ 		wlr_scene_node_set_enabled(&floater->border.tree->node, true);
+ 
+ 		arrange_container(floater, floater->current.width, floater->current.height,
+-			true, ws->gaps_inner);
++			true, ws->gaps_inner, floater->floating_shadows);
+ 	}
+ }
+ 
+@@ -545,7 +575,7 @@ static void arrange_workspace_tiling(struct sway_workspace *ws,
+ 		int width, int height) {
+ 	arrange_children(ws->current.layout, ws->current.tiling,
+ 		ws->current.focused_inactive_child, ws->layers.tiling,
+-		width, height, ws->gaps_inner);
++		width, height, ws->gaps_inner, ws->layers.shadows);
+ }
+ 
+ static void disable_workspace(struct sway_workspace *ws) {
+@@ -573,8 +603,11 @@ static void arrange_output(struct sway_output *output, int width, int height) {
+ 
+ 		bool activated = output->current.active_workspace == child && output->wlr_output->enabled;
+ 
++		wlr_scene_node_reparent(&child->layers.shadows->node, output->layers.tiling);
+ 		wlr_scene_node_reparent(&child->layers.tiling->node, output->layers.tiling);
+ 		wlr_scene_node_reparent(&child->layers.fullscreen->node, output->layers.fullscreen);
++		// tiled shadows go over the background but under every tiled window
++		wlr_scene_node_place_below(&child->layers.shadows->node, &child->layers.tiling->node);
+ 
+ 		for (int i = 0; i < child->current.floating->length; i++) {
+ 			struct sway_container *floater = child->current.floating->items[i];
+@@ -584,6 +617,7 @@ static void arrange_output(struct sway_output *output, int width, int height) {
+ 
+ 		if (activated) {
+ 			struct sway_container *fs = child->current.fullscreen;
++			wlr_scene_node_set_enabled(&child->layers.shadows->node, !fs);
+ 			wlr_scene_node_set_enabled(&child->layers.tiling->node, !fs);
+ 			wlr_scene_node_set_enabled(&child->layers.fullscreen->node, fs);
+ 
+@@ -612,6 +646,7 @@ static void arrange_output(struct sway_output *output, int width, int height) {
+ 				arrange_workspace_floating(child);
+ 			}
+ 		} else {
++			wlr_scene_node_set_enabled(&child->layers.shadows->node, false);
+ 			wlr_scene_node_set_enabled(&child->layers.tiling->node, false);
+ 			wlr_scene_node_set_enabled(&child->layers.fullscreen->node, false);
+ 
+@@ -658,6 +693,7 @@ static void arrange_root(struct sway_root *root) {
+ 		}
+ 
+ 		wlr_scene_node_set_enabled(&con->scene_tree->node, false);
++		container_disable_shadows(con);
+ 	}
+ 
+ 	if (fs) {
+diff --git a/sway/meson.build b/sway/meson.build
+--- a/sway/meson.build
++++ b/sway/meson.build
+@@ -15,6 +15,7 @@ sway_sources = files(
+ 	'xdg_activation_v1.c',
+ 	'xdg_decoration.c',
+ 
++	'desktop/effects.c',
+ 	'desktop/idle_inhibit_v1.c',
+ 	'desktop/layer_shell.c',
+ 	'desktop/output.c',
+@@ -53,6 +54,8 @@ sway_sources = files(
+ 	'commands/default_border.c',
+ 	'commands/default_floating_border.c',
+ 	'commands/default_orientation.c',
++	'commands/dim_inactive.c',
++	'commands/dim_inactive_colors.c',
+ 	'commands/exit.c',
+ 	'commands/exec.c',
+ 	'commands/exec_always.c',
+@@ -105,6 +108,10 @@ sway_sources = files(
+ 	'commands/seat/xcursor_theme.c',
+ 	'commands/set.c',
+ 	'commands/set_from_resource.c',
++	'commands/shadow_blur_radius.c',
++	'commands/shadow_color.c',
++	'commands/shadow_offset.c',
++	'commands/shadows.c',
+ 	'commands/show_marks.c',
+ 	'commands/shortcuts_inhibitor.c',
+ 	'commands/smart_borders.c',
+diff --git a/sway/sway.5.scd b/sway/sway.5.scd
+--- a/sway/sway.5.scd
++++ b/sway/sway.5.scd
+@@ -700,11 +700,39 @@ The default colors are:
+ 	Set default border style for new tiled windows. Config reload won't affect
+ 	existing windows, only newly created ones after the reload.
+ 
++*default_dim_inactive* <value>
++	Sets how much unfocused windows are darkened, as a number from 0.0 to 1.0.
++	A window is unfocused unless its border would be drawn in the
++	*client.focused* colors: it is neither the focused window nor inside the
++	focused container, and a focused workspace contains its tiled windows but
++	not its floating ones. When focus is on an empty workspace, every window is
++	unfocused. An unfocused window is covered across its whole box,
++	the window and its border without the title bar, by its dim color (see
++	*dim_inactive_colors.unfocused* and *dim_inactive_colors.urgent*) at an
++	opacity of _value_ times the alpha of that color. 0.0 darkens nothing.
++	Windows with an amount of their own (see *dim_inactive*) keep it when this
++	changes. The default is 0.0.
++
+ *default_floating_border* normal|none|pixel [<n>]
+ 	Set default border style for new floating windows. This only applies to
+ 	windows that are spawned in floating mode, not windows that become floating
+ 	afterwards.
+ 
++*dim_inactive* <value>
++	Gives the selected windows their own darkening amount while unfocused, as a
++	number from 0.0 to 1.0, instead of the global *default_dim_inactive*. Use it
++	with criteria or in a *for_window* rule. Windows without an amount of their
++	own inherit the global amount, including later changes to it. A window
++	keeps its own amount when the configuration is reloaded.
++
++*dim_inactive_colors.unfocused* <color>
++	Sets the color unfocused windows are darkened with, written as #RRGGBB or
++	#RRGGBBAA. The default is #000000FF.
++
++*dim_inactive_colors.urgent* <color>
++	Sets the color unfocused urgent windows are darkened with, written as
++	#RRGGBB or #RRGGBBAA. The default is #900000FF.
++
+ *exec* <shell command>
+ 	Executes _shell command_ with sh.
+ 
+@@ -869,6 +897,42 @@ The default colors are:
+ 	sense for the variable to be replaced at run time since some arguments do
+ 	need to be known at config time.
+ 
++*shadow_blur_radius* <radius>
++	Sets how far window shadows fade out, in logical pixels, as a whole number
++	from 0 to 99. At a distance _d_ from the shadow's box, a shadow covers
++	alpha \* (1 - _d_ / _radius_)^2 of what lies underneath, where alpha is the
++	alpha of the shadow color, and nothing from _radius_ on; corners are
++	rounded. With a radius of 0 the shadow is exactly the box. The default
++	is 20.
++
++*shadow_color* <color>
++	Sets the shadow color of the focused window, written as #RRGGBB or
++	#RRGGBBAA. The default is #0000007F.
++
++*shadow_inactive_color* <color>
++	Sets the shadow color of unfocused windows, written as #RRGGBB or
++	#RRGGBBAA. The default is #0000007F.
++
++*shadow_offset* <x> <y>
++	Moves every shadow by _x_ logical pixels to the right and _y_ logical pixels
++	down, as whole numbers; negative values move it left and up. The default
++	is 0 0.
++
++*shadows* enable|disable
++	Turns window drop shadows on or off. A shadow starts from the window's box,
++	the window and its border without the title bar, moved by *shadow_offset*,
++	and is drawn below the window that casts it. Shadows of tiled windows are
++	drawn over the workspace background but below all tiled windows; shadows
++	of floating windows are drawn over tiled windows and lower floating
++	windows. Fullscreen windows cast no shadow, and a shadow stays on the
++	output of its window's workspace. The default is disable.
++
++*shadows_on_csd* enable|disable
++	Sets whether windows that agreed through the xdg-decoration protocol to draw
++	their own decorations cast a shadow. Every other window, including one with
++	no border and one that settled on server-side decorations, casts one
++	whenever *shadows* are enabled. The default is disable.
++
+ *show_marks* yes|no
+ 	If *show_marks* is yes, marks will be displayed in the window borders.
+ 	Any mark that starts with an underscore will not be drawn even if
+diff --git a/sway/tree/container.c b/sway/tree/container.c
+--- a/sway/tree/container.c
++++ b/sway/tree/container.c
+@@ -9,6 +9,7 @@
+ #include <wlr/types/wlr_subcompositor.h>
+ #include "linux-dmabuf-unstable-v1-protocol.h"
+ #include "sway/config.h"
++#include "sway/desktop/effects.h"
+ #include "sway/desktop/transaction.h"
+ #include "sway/input/input-manager.h"
+ #include "sway/input/seat.h"
+@@ -104,6 +105,7 @@ struct sway_container *container_create(struct sway_view *view) {
+ 	//     - buffer used for output enter/leave events for foreign_toplevel
+ 	bool failed = false;
+ 	c->scene_tree = alloc_scene_tree(root->staging, &failed);
++	c->floating_shadows = alloc_scene_tree(c->scene_tree, &failed);
+ 
+ 	c->title_bar.tree = alloc_scene_tree(c->scene_tree, &failed);
+ 	c->title_bar.border = alloc_scene_tree(c->title_bar.tree, &failed);
+@@ -148,6 +150,11 @@ struct sway_container *container_create(struct sway_view *view) {
+ 					&c->output_handler_destroy);
+ 			c->output_handler->point_accepts_input = handle_point_accepts_input;
+ 		}
++
++		if (!failed && !container_effects_create(c)) {
++			sway_log(SWAY_ERROR, "Failed to allocate the effect nodes");
++			failed = true;
++		}
+ 	}
+ 
+ 	if (!failed && !scene_descriptor_assign(&c->scene_tree->node,
+@@ -156,6 +163,7 @@ struct sway_container *container_create(struct sway_view *view) {
+ 	}
+ 
+ 	if (failed) {
++		container_effects_destroy(c);
+ 		wlr_scene_node_destroy(&c->scene_tree->node);
+ 		free(c);
+ 		return NULL;
+@@ -169,6 +177,7 @@ struct sway_container *container_create(struct sway_view *view) {
+ 	c->pending.layout = L_NONE;
+ 	c->view = view;
+ 	c->alpha = 1.0f;
++	c->dim_inactive = -1.0f;
+ 	c->marks = create_list();
+ 
+ 	wl_signal_init(&c->events.destroy);
+@@ -210,6 +219,10 @@ static bool container_is_current_parent_focused(struct sway_container *con) {
+ 	return false;
+ }
+ 
++bool container_is_current_unfocused(struct sway_container *con) {
++	return !con->current.focused && !container_is_current_parent_focused(con);
++}
++
+ static struct border_colors *container_get_current_colors(
+ 		struct sway_container *con) {
+ 	struct border_colors *colors;
+@@ -307,6 +320,8 @@ void container_update(struct sway_container *con) {
+ 		sway_text_node_set_color(con->title_bar.marks_text, colors->text);
+ 		sway_text_node_set_background(con->title_bar.marks_text, colors->background);
+ 	}
++
++	container_update_dim(con);
+ }
+ 
+ void container_update_itself_and_parents(struct sway_container *con) {
+@@ -517,6 +532,12 @@ void container_destroy(struct sway_container *con) {
+ 
+ 	list_free_items_and_destroy(con->marks);
+ 
++	// The dim node may be inside the view's tree and the shadow tree in a
++	// workspace layer, so neither goes away with the container's tree.
++	container_effects_destroy(con);
++	// Shadows of windows that floated inside this container outlive it
++	scene_node_disown_children(con->floating_shadows);
++
+ 	if (con->view && con->view->container == con) {
+ 		con->view->container = NULL;
+ 		wlr_scene_node_destroy(&con->output_handler->node);
+diff --git a/sway/tree/view.c b/sway/tree/view.c
+--- a/sway/tree/view.c
++++ b/sway/tree/view.c
+@@ -1156,6 +1156,7 @@ void view_set_urgent(struct sway_view *view, bool enable) {
+ 			wl_event_source_remove(view->urgent_timer);
+ 			view->urgent_timer = NULL;
+ 		}
++		container_update_itself_and_parents(view->container);
+ 	}
+ 
+ 	ipc_event_window(view->container, "urgent");
+@@ -1209,6 +1210,11 @@ void view_save_buffer(struct sway_view *view) {
+ 		return;
+ 	}
+ 
++	// Keep the saved surfaces where the live ones are, below anything placed
++	// on top of the view such as its dimming.
++	wlr_scene_node_place_above(&view->saved_surface_tree->node,
++		&view->content_tree->node);
++
+ 	// Enable and disable the saved surface tree like so to atomitaclly update
+ 	// the tree. This will prevent over damaging or other weirdness.
+ 	wlr_scene_node_set_enabled(&view->saved_surface_tree->node, false);
+diff --git a/sway/tree/workspace.c b/sway/tree/workspace.c
+--- a/sway/tree/workspace.c
++++ b/sway/tree/workspace.c
+@@ -73,10 +73,12 @@ struct sway_workspace *workspace_create(struct sway_output *output,
+ 	node_init(&ws->node, N_WORKSPACE, ws);
+ 
+ 	bool failed = false;
++	ws->layers.shadows = alloc_scene_tree(root->staging, &failed);
+ 	ws->layers.tiling = alloc_scene_tree(root->staging, &failed);
+ 	ws->layers.fullscreen = alloc_scene_tree(root->staging, &failed);
+ 
+ 	if (failed) {
++		wlr_scene_node_destroy(&ws->layers.shadows->node);
+ 		wlr_scene_node_destroy(&ws->layers.tiling->node);
+ 		wlr_scene_node_destroy(&ws->layers.fullscreen->node);
+ 		free(ws);
+@@ -143,8 +145,10 @@ void workspace_destroy(struct sway_workspace *workspace) {
+ 		return;
+ 	}
+ 
++	scene_node_disown_children(workspace->layers.shadows);
+ 	scene_node_disown_children(workspace->layers.tiling);
+ 	scene_node_disown_children(workspace->layers.fullscreen);
++	wlr_scene_node_destroy(&workspace->layers.shadows->node);
+ 	wlr_scene_node_destroy(&workspace->layers.tiling->node);
+ 	wlr_scene_node_destroy(&workspace->layers.fullscreen->node);
+ 
