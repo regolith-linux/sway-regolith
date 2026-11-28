@@ -59,3 +59,7 @@ Restrictions: allow-stderr
 Tests: move-direction-ppt
 Depends: sway-regolith, dbus, jq, foot, fonts-dejavu-core
 Restrictions: allow-stderr
+
+Tests: xwayland-demands-attention
+Depends: sway-regolith, xwayland, python3, python3-xlib, fonts-dejavu-core
+Restrictions: allow-stderr

@@ -1,0 +1,266 @@
+Description: X11 demands-attention requests make the window urgent, as in i3
+ Java, Wine and Qt programs ask for attention with a _NET_WM_STATE client
+ message adding, removing or toggling _NET_WM_STATE_DEMANDS_ATTENTION. i3
+ treats it like the ICCCM urgency hint; sway ignored it, while wlroots still
+ added the atom to the window's _NET_WM_STATE. The request now drives the
+ window's urgency under the urgency-hint rules (never for the focused window,
+ urgent deny, force_display_urgency_hint), and the atom is kept in step with
+ the urgency sway shows, whatever set or cleared it. A window that maps with
+ the urgency hint or the atom already set is urgent once mapped, unless it
+ takes the focus or a rule denies it.
+ .
+ for_window rules are checked again when a window becomes urgent, as i3 does,
+ so rules with urgent= criteria can fire (each rule still runs once per
+ window). urgent deny now also covers activation requests that would make the
+ window urgent (swaywm/sway#9041). A window that unmaps while urgent no longer
+ comes back urgent, and a window removing its WM_HINTS property no longer
+ crashes sway.
+ .
+ The five upstream commits, squashed; they apply to 1.11 plus the series
+ unchanged apart from context.
+Author: rego-port-bot <339843353+rego-port-bot@users.noreply.github.com>
+Bug: https://github.com/swaywm/sway/issues/9041
+Forwarded: https://github.com/swaywm/sway/compare/master...cfsmp3:sway-regolith:xwayland-demands-attention
+Last-Update: 2026-11-28
+---
+ include/sway/tree/view.h |  9 +++++++++
+ sway/desktop/xwayland.c  | 49 ++++++++++++++++++++++++++++++++++++++++--------
+ sway/sway.5.scd          | 10 ++++++++++
+ sway/tree/view.c         | 41 +++++++++++++++++++++++++++++++++++++---
+ 4 files changed, 98 insertions(+), 11 deletions(-)
+
+--- a/include/sway/tree/view.h
++++ b/include/sway/tree/view.h
+@@ -51,6 +51,7 @@ struct sway_view_impl {
+ 			int width, int height);
+ 	void (*set_activated)(struct sway_view *view, bool activated);
+ 	void (*set_tiled)(struct sway_view *view, bool tiled);
++	void (*set_urgent)(struct sway_view *view, bool urgent);
+ 	void (*set_fullscreen)(struct sway_view *view, bool fullscreen);
+ 	void (*set_resizing)(struct sway_view *view, bool resizing);
+ 	bool (*wants_floating)(struct sway_view *view);
+@@ -156,6 +157,7 @@ struct sway_xwayland_view {
+ 	struct wl_listener set_startup_id;
+ 	struct wl_listener set_window_type;
+ 	struct wl_listener set_hints;
++	struct wl_listener request_demands_attention;
+ 	struct wl_listener set_decorations;
+ 	struct wl_listener associate;
+ 	struct wl_listener dissociate;
+@@ -263,6 +265,13 @@ void view_request_activate(struct sway_view *view, struct sway_seat *seat);
+  */
+ void view_request_urgent(struct sway_view *view);
+ 
++/**
++ * Called when the view's client asks to set or clear its own urgency. The
++ * request is ignored under "urgent deny", and a request to clear urgency is
++ * ignored while the urgency timer runs.
++ */
++void view_request_set_urgent(struct sway_view *view, bool enable);
++
+ /**
+  * If possible, instructs the client to change their decoration mode.
+  */
+--- a/sway/desktop/xwayland.c
++++ b/sway/desktop/xwayland.c
+@@ -299,6 +299,16 @@ static void set_tiled(struct sway_view *view, bool tiled) {
+ 	wlr_xwayland_surface_set_maximized(surface, tiled, tiled);
+ }
+ 
++static void set_urgent(struct sway_view *view, bool urgent) {
++	if (xwayland_view_from_view(view) == NULL) {
++		return;
++	}
++	struct wlr_xwayland_surface *surface = view->wlr_xwayland_surface;
++	if (surface->demands_attention != urgent) {
++		wlr_xwayland_surface_set_demands_attention(surface, urgent);
++	}
++}
++
+ static void set_fullscreen(struct sway_view *view, bool fullscreen) {
+ 	if (xwayland_view_from_view(view) == NULL) {
+ 		return;
+@@ -405,6 +415,7 @@ static const struct sway_view_impl view_impl = {
+ 	.configure = configure,
+ 	.set_activated = set_activated,
+ 	.set_tiled = set_tiled,
++	.set_urgent = set_urgent,
+ 	.set_fullscreen = set_fullscreen,
+ 	.wants_floating = wants_floating,
+ 	.is_transient_for = is_transient_for,
+@@ -478,6 +489,7 @@ static void handle_destroy(struct wl_listener *listener, void *data) {
+ 	wl_list_remove(&xwayland_view->set_startup_id.link);
+ 	wl_list_remove(&xwayland_view->set_window_type.link);
+ 	wl_list_remove(&xwayland_view->set_hints.link);
++	wl_list_remove(&xwayland_view->request_demands_attention.link);
+ 	wl_list_remove(&xwayland_view->set_decorations.link);
+ 	wl_list_remove(&xwayland_view->associate.link);
+ 	wl_list_remove(&xwayland_view->dissociate.link);
+@@ -537,6 +549,13 @@ static void handle_map(struct wl_listener *listener, void *data) {
+ 			&xwayland_view->surface_tree_destroy);
+ 	}
+ 
++	// Urgency requested before mapping, now that window rules and focus on
++	// map have been applied
++	if ((xsurface->hints && xcb_icccm_wm_hints_get_urgency(xsurface->hints)) ||
++			xsurface->demands_attention) {
++		view_request_set_urgent(view, true);
++	}
++
+ 	transaction_commit_dirty();
+ }
+ 
+@@ -751,16 +770,25 @@ static void handle_set_hints(struct wl_listener *listener, void *data) {
+ 	if (xsurface->surface == NULL || !xsurface->surface->mapped) {
+ 		return;
+ 	}
+-	const bool hints_urgency = xcb_icccm_wm_hints_get_urgency(xsurface->hints);
+-	if (!hints_urgency && view->urgent_timer) {
+-		// The view is in the timeout period. We'll ignore the request to
+-		// unset urgency so that the view remains urgent until the timer clears
+-		// it.
++	// hints is NULL when the client removed WM_HINTS
++	const bool hints_urgency = xsurface->hints &&
++		xcb_icccm_wm_hints_get_urgency(xsurface->hints);
++	view_request_set_urgent(view, hints_urgency);
++	transaction_commit_dirty();
++}
++
++static void handle_request_demands_attention(struct wl_listener *listener,
++		void *data) {
++	struct sway_xwayland_view *xwayland_view =
++		wl_container_of(listener, xwayland_view, request_demands_attention);
++	struct sway_view *view = &xwayland_view->view;
++	struct wlr_xwayland_surface *xsurface = view->wlr_xwayland_surface;
++	if (xsurface->surface == NULL || !xsurface->surface->mapped) {
++		// Handled on map
+ 		return;
+ 	}
+-	if (view->allow_request_urgent) {
+-		view_set_urgent(view, hints_urgency);
+-	}
++	view_request_set_urgent(view, xsurface->demands_attention);
++	transaction_commit_dirty();
+ }
+ 
+ static void handle_associate(struct wl_listener *listener, void *data) {
+@@ -849,6 +877,11 @@ struct sway_xwayland_view *create_xwayland_view(struct wlr_xwayland_surface *xsu
+ 	wl_signal_add(&xsurface->events.set_hints, &xwayland_view->set_hints);
+ 	xwayland_view->set_hints.notify = handle_set_hints;
+ 
++	wl_signal_add(&xsurface->events.request_demands_attention,
++		&xwayland_view->request_demands_attention);
++	xwayland_view->request_demands_attention.notify =
++		handle_request_demands_attention;
++
+ 	wl_signal_add(&xsurface->events.set_decorations,
+ 			&xwayland_view->set_decorations);
+ 	xwayland_view->set_decorations.notify = handle_set_decorations;
+--- a/sway/sway.5.scd
++++ b/sway/sway.5.scd
+@@ -776,6 +776,8 @@ The default colors are:
+ 
+ *for_window* <criteria> <command>
+ 	Whenever a window that matches _criteria_ appears, run list of commands.
++	Rules are checked again when a window becomes urgent, so rules with
++	_urgent_ criteria can apply then. Each rule runs at most once per window.
+ 	See *CRITERIA* for more details.
+ 
+ *gaps* inner|outer|horizontal|vertical|top|right|bottom|left <amount>
+@@ -924,6 +926,14 @@ The default colors are:
+ 	Using _enable_ or _disable_ manually sets or unsets the window's urgent
+ 	state. Using _allow_ or _deny_ controls the window's ability to set itself
+ 	as urgent. By default, windows are allowed to set their own urgency.
++	With _deny_, activation requests that would set the urgent state are
++	ignored too (see *focus_on_window_activation*); activation requests that
++	focus the window are unaffected.
++
++	X11 windows set their own urgency with the urgency hint in WM_HINTS or
++	with the \_NET\_WM\_STATE\_DEMANDS\_ATTENTION state, which they may
++	already have when they map. sway keeps that state in the window's
++	\_NET\_WM\_STATE exactly while the window is urgent.
+ 
+ *workspace* [--no-auto-back-and-forth] [number] <[num:]name>
+ 	Switches to the specified workspace. The _num:_ portion of the name is
+--- a/sway/tree/view.c
++++ b/sway/tree/view.c
+@@ -424,11 +424,11 @@ void view_request_activate(struct sway_view *view, struct sway_seat *seat) {
+ 			seat_set_focus_container(seat, view->container);
+ 			container_raise_floating(view->container);
+ 		} else {
+-			view_set_urgent(view, true);
++			view_request_set_urgent(view, true);
+ 		}
+ 		break;
+ 	case FOWA_URGENT:
+-		view_set_urgent(view, true);
++		view_request_set_urgent(view, true);
+ 		break;
+ 	case FOWA_FOCUS:
+ 		if (container_is_scratchpad_hidden_or_child(view->container)) {
+@@ -446,10 +446,32 @@ void view_request_activate(struct sway_view *view, struct sway_seat *seat) {
+ 
+ void view_request_urgent(struct sway_view *view) {
+ 	if (config->focus_on_window_activation != FOWA_NONE) {
+-		view_set_urgent(view, true);
++		view_request_set_urgent(view, true);
++		transaction_commit_dirty();
+ 	}
+ }
+ 
++static void view_send_urgent(struct sway_view *view) {
++	if (view->impl->set_urgent) {
++		view->impl->set_urgent(view, view_is_urgent(view));
++	}
++}
++
++void view_request_set_urgent(struct sway_view *view, bool enable) {
++	if (!view->allow_request_urgent) {
++		sway_log(SWAY_DEBUG, "View %p may not set its own urgency", view);
++	} else if (!enable && view->urgent_timer) {
++		// The view is in the timeout period. We'll ignore the request to
++		// unset urgency so that the view remains urgent until the timer clears
++		// it.
++	} else {
++		view_set_urgent(view, enable);
++	}
++	// The client may already have recorded its request as granted, e.g.
++	// Xwayland updates _NET_WM_STATE itself, so tell it the outcome
++	view_send_urgent(view);
++}
++
+ void view_set_csd_from_server(struct sway_view *view, bool enabled) {
+ 	sway_log(SWAY_DEBUG, "Telling view %p to set CSD to %i", view, enabled);
+ 	if (view->xdg_decoration) {
+@@ -929,6 +951,11 @@ void view_unmap(struct sway_view *view) {
+ 	struct sway_container *parent = view->container->pending.parent;
+ 	struct sway_workspace *ws = view->container->pending.workspace;
+ 	container_begin_destroy(view->container);
++	// A view that maps again starts out non-urgent, like a new window
++	if (view_is_urgent(view)) {
++		view->urgent = (struct timespec){ 0 };
++		view_send_urgent(view);
++	}
+ 	if (parent) {
+ 		container_reap_empty(parent);
+ 	} else if (ws) {
+@@ -1158,11 +1185,19 @@ void view_set_urgent(struct sway_view *view, bool enable) {
+ 		}
+ 	}
+ 
++	view_send_urgent(view);
++
+ 	ipc_event_window(view->container, "urgent");
+ 
+ 	if (!container_is_scratchpad_hidden_or_child(view->container)) {
+ 		workspace_detect_urgent(view->container->pending.workspace);
+ 	}
++
++	// As in i3, rules are checked again so urgent criteria can match. This
++	// comes last because a rule may focus the view, which clears urgency.
++	if (enable) {
++		view_execute_criteria(view);
++	}
+ }
+ 
+ bool view_is_urgent(struct sway_view *view) {

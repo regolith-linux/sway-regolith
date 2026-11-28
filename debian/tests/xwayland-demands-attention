@@ -1,0 +1,6 @@
+#!/bin/sh
+# 32-xwayland-demands-attention: X11 _NET_WM_STATE_DEMANDS_ATTENTION
+# requests drive urgency as in i3, the atom follows sway's urgency, urgent=
+# rules apply on urgency and urgent deny covers activation requests.
+set -eu
+exec python3 debian/tests/xwayland-demands-attention.py
